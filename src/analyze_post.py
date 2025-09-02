@@ -15,16 +15,24 @@ import umap
 
 load_dotenv()  # reads .env in the working dir (won't override existing env by default)
 
+def prompt_ai(client, model="z-ai/glm-4.5-air:free", messages=None, temperature=0):
+   return client.chat.completions.create(
+      model="z-ai/glm-4.5-air:free",
+      messages=messages,
+      temperature=0
+  )
+
 def gather_advice(client, doc: str):
   user = f"""
-  Task: If the text below contains multiple independent pieces of advice, (A) extract each advice item verbatim and (B) group related items by theme. If not a collection, return exactly {"{"}"type":"single"{"}"}.
+  Task: If the text below contains multiple independent pieces of advice, (A) extract each advice item verbatim and (B) group related items by theme. If not a collection, return exactly {{"type":"single"}}.
 
   DEFINITIONS
   - "Advice item": a self-contained, actionable tip that stands on its own (often a bullet, numbered line, or imperative sentence).
   - "Collection": ≥3 distinct advice items or a clear list of tips.
 
   OUTPUT
-  Return JSON exactly in this schema:
+  Return JSON exactly in this schema, with no extra text, no markdown formatting, and no explanations.
+  Schema (keys must appear exactly as shown):
   {{
     "type": "collection",
     "items": [
@@ -37,35 +45,36 @@ def gather_advice(client, doc: str):
   }}
 
   ITEM RULES
-  - Each item is a verbatim, contiguous substring of the original text (provide 0-based "start"/"end" offsets).
+  - Each item must be a verbatim, contiguous substring of the original text (0-based "start"/"end" offsets; "end" is exclusive).
   - Prefer a single sentence that reads as one actionable tip.
-  - Length target ≈ 40–200 chars. If the only suitable sentence is longer, include it in full (do not paraphrase).
+  - Target length ≈ 40–200 chars; if the only suitable sentence is longer, include it whole (no paraphrasing).
   - If a bullet contains multiple distinct tips, extract multiple items (one per tip).
   - Exclude boilerplate (greetings, headers, credits) by not selecting them.
-  - You may omit leading bullet/number markers and surrounding whitespace from the span; otherwise the item must match the original text exactly.
+  - You may omit leading bullet/number markers and surrounding whitespace; otherwise the item must match the original exactly.
 
   GROUPING RULES
-  - Create 2–6 coherent themes.
-  - Use short labels (≤ 3 words), e.g., "Sleep hygiene", "Planning", "Burnout".
+  - Create 2–6 coherent, disjoint themes.
+  - Labels ≤ 3 words (e.g., "Sleep hygiene", "Planning", "Burnout").
   - Use 0-based "item_indexes" that reference positions in "items".
-  - Groups must be disjoint; put leftovers in "unassigned".
-  - Prefer grouping by outcome/behavior (e.g., routines, environment, diet, mindset).
+  - Any item not placed in a group must be referenced by index in "unassigned".
+  - Prefer grouping by outcome/behavior (routines, environment, diet, mindset).
+
+  VALIDATION
+  - If the text is not a collection, output exactly: {{"type":"single"}} (no other keys).
+  - If it is a collection, output exactly one JSON object with the schema above.
+  - Never output markdown fences or explanatory text.
 
   TEXT
-  ```{doc}```
+  {doc}
   """
 
-
-  completion = client.chat.completions.create(
-    extra_body={},
-    model="z-ai/glm-4.5-air:free",
-    messages=[
-      {
-        "role": "user",
-        "content": user
-      }
-    ]
-  )
+  completion = prompt_ai(
+     client, 
+     messages=[
+        {"role": "system", "content": "You are a careful extraction engine. Output must be strictly valid JSON. Do not include markdown fences, code blocks, or commentary. Start your response with \"{\" and end it with \"}\"."},
+        {"role": "user", "content": user}
+      ]
+    )
 
   return completion.choices[0].message.content
 
@@ -87,7 +96,7 @@ def get_alltext(df):
    # Returns a Series with combined text
    return "title: " + df['title'] + ". body: " + df['selftext'].fillna('')
 
-def process_raw_data(raw_data):
+def add_advice(raw_data):
     # This function is a placeholder for any additional processing needed on raw data
     data = raw_data.copy() # Create a copy
 
@@ -96,11 +105,11 @@ def process_raw_data(raw_data):
 
     data.drop(columns=["selftext", "title"], inplace=True)
 
-    print(data['alltext']).head()
+    print(data['alltext'].head())
 
     client = load_client()
 
-    def extract_items(text):
+    def extract_items(client, text):
       res = gather_advice(client, text)        # call your LLM
       try:
           parsed = json.loads(res)             # parse string → dict
@@ -108,59 +117,95 @@ def process_raw_data(raw_data):
           print("JSON parse error:", e, res)
           return []
 
-      if parsed.get("type") == "collection":
-          return parsed.get("items", [])
-      else:
-          return []  # single-theme posts: no items
+      if parsed.get("type") != "collection":
+          return []
 
+      items = parsed.get("items", [])
+      groups = parsed.get("groups", [])
+
+      # Map item indexes to group labels
+      group_map = {}
+      for g in groups:
+          for i in g.get("item_indexes", []):
+              group_map.setdefault(i, []).append(g["label"])
+
+      # Merge advice items with their groups
+      merged = []
+      for idx, item in enumerate(items):
+          merged.append({
+              "advice": item["text"],
+              "grouping": group_map.get(idx, [])
+          })
+        
+      return merged
+
+    # Add advice grouping dictionary pair to text
     data["advice_agg"] = data["alltext"].map(lambda x: extract_items(client, x))
-    data
+    data.drop(columns="alltext", inplace=True)
+    data = data.explode("advice_agg").reset_index(drop=True)
 
+    # Drop na
+    data.dropna(subset="advice_agg", inplace=True)
 
-    # Embeddings
-    llm = load_llm()
-    data["embeddings"] = llm.encode(data["cleaned_text"].tolist(), show_progress_bar=True, convert_to_numpy=True).tolist()
+    # Expand dictionary
+    data["advice"] = data["advice_agg"].map(lambda d: d.get("advice", "") if isinstance(d, dict) else "")
+    data["grouping_list"] = data["advice_agg"].map(lambda d: d.get("grouping", []) if isinstance(d, dict) else [])
 
-    # Clustering
-    X = np.vstack(data["embeddings"].values)
-
-    # UMAP dimensionality reduction
-    reducer = umap.UMAP(n_neighbors=25, n_components=100, metric="cosine", random_state=42)
-    X = reducer.fit_transform(X)
-
-    # HDBSCAN clustering
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=5, metric="euclidean", cluster_selection_method="eom")
-    labels = clusterer.fit_predict(X)
-
-    data["cluster"] = labels
-
-    # Cluster names
-    clusters = data["cluster"].unique()
-    cluster_labels = {
-        cluster: label_cluster(data[data['cluster'] == cluster]['cleaned_text'].values) for cluster in clusters
-    }
-
-    data['cluster_name'] = data['cluster'].map(cluster_labels)
-
-    data.drop(columns=["embeddings", "subreddit_name_prefixed", 'title', 'ups', 'upvote_ratios'], inplace=True)
-
+    # Return dataframe
     return data
 
-def label_cluster(texts):
-    words = re.findall(r"[a-z][a-z]+", " ".join(texts).lower())
-    words = [w for w in words if w not in ENGLISH_STOP_WORDS and len(w) > 3]
-    # top 2 keywords
-    from collections import Counter
-    common = [w for w,_ in Counter(words).most_common(2)]
-    return " / ".join(common) if common else "General"
+def regroup_clusters(client, df):
+  """Given a dataframe, regroups the groupings and modifies in place."""
+  advice = df['advice']
+  groupings = df['grouping']
+
+  pairings = list(zip(advice, groupings))
+
+  # Build the message to send to the LLM
+  user_prompt = f"""
+  You are given a list of (advice_text, grouping_label) pairs.
+
+  Your job: review the labels and return a JSON object mapping each old grouping label
+  to a new, consolidated label. 
+
+  Guidelines:
+  - Groupings should be short (1–3 words).
+  - Merge synonymous or redundant labels into one.
+  - Make labels clear and intuitive.
+  - Only output the JSON mapping, no explanation, no markdown.
+
+  Example:
+  Input: [("Go to bed early","Sleep"), ("Set alarm","Sleep Schedule"), ("Read books","Reading")]
+  Output: {{"Sleep Hygiene":"Sleep","Sleep Schedule":"Sleep"}}
+
+  Now process this data:
+  {pairings}
+  """
+
+  # Call the LLM
+  completion = prompt_ai(
+      client,
+      messages=[{"role": "user", "content": user_prompt}],
+  )
+
+  raw = completion.choices[0].message.content.strip()
+
+  # Try parsing JSON safely
+  try:
+      mapping = json.loads(raw)
+  except Exception as e:
+      raise ValueError(f"Failed to parse JSON from model: {e}\nRaw output:\n{raw}")
+
+  # Remap groupings
+  df['grouping'] = df['grouping'].map(lambda g: mapping.get(g, g))
+
+  return df
 
 if __name__ == "__main__":
-  data = load_data("raw_data")
-  print(data.head())
-  example_post = data.iloc[0]['selftext']
+  raw_data = load_data("raw_data")
+  raw_data = raw_data.iloc[0:1]
+  processed_data = add_advice(raw_data)
+  print(processed_data)
 
-  client = load_client()
-  
-  res = gather_advice(client, example_post)
-
-  print(res)
+  # Save processed_data
+  processed_data.to_csv("p2.csv", index=False)
