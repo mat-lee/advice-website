@@ -1,22 +1,24 @@
 import os
-import re
 
+from dotenv import load_dotenv
 import numpy as np
 import pandas as pd
 import praw
 
+load_dotenv()
+
 def save_data(df, name):
-    df.to_csv(f"{name}.csv", index=False)
+    df.to_csv(f"data/{name}.csv", index=False, encoding="utf-8")
 
 def load_data(name):
-    df = pd.read_csv(f"{name}.csv")
+    df = pd.read_csv(f"data/{name}.csv", encoding="utf-8")
     return df
 
 def webscrape_reddit():
     data = {}
 
     def add_to_data(data, s):
-        save_stats = ['id', 'selftext', 'subreddit_name_prefixed', 'title', 'ups', 'upvote_ratios']
+        save_stats = ['id', 'selftext', 'subreddit_name_prefixed', 'title', 'ups', 'upvote_ratio']
 
         for stat in save_stats:
             if stat not in data:
@@ -34,7 +36,7 @@ def webscrape_reddit():
         user_agent=os.getenv("REDDIT_USER_AGENT")
     )
 
-    for s in reddit.subreddit("getdisciplined").top(time_filter="all", limit=100):
+    for s in reddit.subreddit("getdisciplined").top(time_filter="all", limit=250):
         add_to_data(data, s)
     
     data = pd.DataFrame(data)
