@@ -4,7 +4,7 @@ import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  // base: '/advice-webiste/', // Replace with your actual repo name
+  base: '/advice-website/', // Replace with your actual repo name
   build: {
     outDir: 'dist'
   }

@@ -36,7 +36,7 @@ function AdviceAggregator() {
     const loadCSVData = async () => {
       try {
         setLoading(true);
-        const response = await fetch('/display_data.csv');
+        const response = await fetch('/advice-website/display_data.csv');
         if (!response.ok) throw new Error(`Failed to load CSV file: ${response.statusText}`);
         const csvText = await response.text();
 
