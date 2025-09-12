@@ -14,7 +14,8 @@ from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import umap
 
-FREE_OPENROUTER_MODEL = "mistralai/devstral-small-2505:free" # Super lightweight model
+# FREE_OPENROUTER_MODEL = "mistralai/devstral-small-2505:free" # Super lightweight model
+FREE_OPENROUTER_MODEL = "openrouter/sonoma-dusk-alpha"
 MAX_CHARS = 10000 # approximately 2500 tokens
 
 load_dotenv()
@@ -93,7 +94,7 @@ Return JSON only (no markdown/extras), exactly in this schema:
 }}
 
 Rules:
-- "advice": a verbatim substring of TEXT that is a self-contained actionable tip (40-200 chars).
+- "advice": a verbatim substring of TEXT that is a self-contained actionable tip. It may be as long as necessary to convey the point.
 - Replace all double quotes in advice text with single quotes
 - "group": a short label (≤3 words) describing the theme of that advice.
 - Every "advice" must make complete sense on its own
@@ -223,7 +224,7 @@ def add_advice(client, raw_data):
 
     return data
 
-def regroup_clusters(client, df):
+def regroup_clusters(client, df, max_groups=None):
     """Given a dataframe, modifies the data inplace and regroups the groupings"""
     if len(df) == 0:
         print("No data to regroup")
@@ -233,12 +234,18 @@ def regroup_clusters(client, df):
     counts = df['group'].value_counts().to_dict()
     print(f"Original groups: {counts}")
 
+    constraint = (
+        f"\nIMPORTANT: Ensure the total number of DISTINCT output values is at most {max_groups}. "
+        f"You currently have {len(counts)} groups and need to reduce to {max_groups} or fewer."
+        if max_groups else ""
+    )
+
     # Build a small prompt
     user_prompt = f"""
 You are given a list of existing group labels with their frequencies.
 Return a JSON object that maps EACH old label to ONE consolidated canonical label.
 Keep labels short (1-3 words). Merge synonyms/redundant labels into a single canonical label.
-Output JSON only, no markdown or commentary.
+Output JSON only, no markdown or commentary.{constraint}
 
 Example:
 Input counts: {{"Sleep": 42, "Sleep Schedule": 20, "Reading": 10}}
@@ -284,29 +291,319 @@ Input counts:
 
     return df
 
-if __name__ == "__main__":
-    print("Loading raw data...")
-    raw_data = load_data("raw_data")
-    raw_data = raw_data.iloc[0:3]
-    print(f"Loaded {len(raw_data)} posts")
+def regroup_clusters(client, df, max_groups=None):
+    """
+    Improved version with better debugging and error handling
+    """
+    if len(df) == 0:
+        print("No data to regroup")
+        return df
     
-    # For testing, uncomment this line to process only first 5 posts
-    # raw_data = raw_data.iloc[0:5]
-    
-    print("Getting OpenRouter client...")
-    client = get_openrouter_client()
-
-    print("Processing data to extract advice...")
-    processed_data = add_advice(client, raw_data)
-    
-    if len(processed_data) > 0:
-        print("Regrouping similar categories...")
-        regroup_clusters(client, processed_data)
-
-        # print("Saving processed data...")
-        # save_data(processed_data, "processed_data")
-        # print(f"Successfully saved {len(processed_data)} pieces of advice")
-    else:
-        print("No advice was extracted. Check your input data and API responses.")
+    # Make a copy to avoid modifying original
+    df = df.copy()
         
-    print("Processing complete!")
+    # Get label counts to help the model choose canonical names
+    counts = df['group'].value_counts().to_dict()
+    print(f"Original groups ({len(counts)} total): {counts}")
+
+    # If we already have few enough groups, skip regrouping
+    if max_groups and len(counts) <= max_groups:
+        print(f"Already have {len(counts)} groups, which is <= {max_groups}. Skipping regrouping.")
+        return df
+    
+    # Base examples (always included)
+    examples = """
+Examples of required consolidation from your data:
+- "Habits", "Daily Habits", "Healthy Habits", "Habit Tracking" → ALL become "Habits"
+- "Self-Care", "Self-Love", "Self-Acceptance", "Self-Compassion" → ALL become "Self-Care" 
+- "Focus", "Focus Management", "Focus Duration", "Focus Enjoyment" → ALL become "Focus"
+- "Time Management", "Task Management", "Planning", "Organization" → ALL become "Planning"
+"""
+    
+    # Conditional constraint
+    if max_groups:
+        constraint = f"""
+CRITICAL TARGET: You must reduce {len(counts)} groups down to {max_groups} or fewer groups.
+This means MANY input labels must map to the SAME output labels. Be very aggressive in merging.
+"""
+    else:
+        constraint = """
+GOAL: Consolidate similar/synonymous groups into canonical categories to reduce redundancy.
+"""
+    
+    # Build prompt
+    user_prompt = f"""
+You have {len(counts)} group labels that need consolidation.
+
+{constraint}
+
+{examples}
+
+Current labels: {list(counts.keys())}
+
+Return JSON mapping each input to its consolidated category:
+{{"input_label": "canonical_category", ...}}
+"""
+
+    # Call the LLM
+    completion = prompt_ai(
+        client,
+        messages=[
+            {"role": "system", "content": "You are a label consolidation expert. Return only valid JSON mapping old labels to new canonical labels."},
+            {"role": "user", "content": user_prompt}
+        ],
+    )
+
+    if not completion or not completion.choices:
+        print("Failed to get regrouping response, keeping original groups")
+        return df
+
+    raw = completion.choices[0].message.content
+    if not raw:
+        print("Empty regrouping response, keeping original groups")  
+        return df
+        
+    raw = raw.strip()
+    raw = sanitize_json_string(raw)
+    print(f"Raw API response: {raw[:200]}...")  # Debug print
+
+    # Try parsing JSON safely
+    try:
+        mapping = json.loads(raw)
+        print(f"Parsed mapping: {mapping}")
+        
+        # Validate that all original groups are in the mapping
+        missing_keys = set(counts.keys()) - set(mapping.keys())
+        if missing_keys:
+            print(f"Warning: Missing mappings for groups: {missing_keys}")
+            # Add identity mappings for missing keys
+            for key in missing_keys:
+                mapping[key] = key
+
+        # Count unique output values
+        unique_outputs = len(set(mapping.values()))
+        print(f"Mapping creates {unique_outputs} unique output groups")
+
+        if max_groups and unique_outputs > max_groups * 1.2:  # Allow 20% over target
+            print(f"WARNING: AI didn't consolidate enough! Got {unique_outputs}, wanted {max_groups}")
+            # You could add fallback logic here
+                
+    except Exception as e:
+        print(f"Failed to parse regrouping JSON: {e}")
+        print(f"Raw output:\n{raw}")
+        return df
+
+    # Apply the mapping
+    original_groups = df['group'].value_counts()
+    df['group'] = df['group'].map(lambda g: mapping.get(g, g))
+    
+    # Show results
+    final_counts = df['group'].value_counts().to_dict()
+    print(f"Final groups ({len(final_counts)} total): {final_counts}")
+    print(f"Reduced from {len(original_groups)} to {len(final_counts)} groups")
+
+    return df
+
+def filter_and_format_advice(client, df):
+    """
+    Filter out rows that don't contain standalone advice and fix formatting/capitalization
+    """
+    if len(df) == 0:
+        print("No data to filter and format")
+        return df
+    
+    print(f"Starting filtering and formatting with {len(df)} advice items")
+    
+    # Process advice in batches to avoid token limits
+    batch_size = 20
+    filtered_items = []
+    
+    for i in range(0, len(df), batch_size):
+        batch = df.iloc[i:i + batch_size]
+        
+        # Create list of advice items for the batch
+        advice_list = []
+        for idx, row in batch.iterrows():
+            advice_list.append(f"{idx}: {row['advice']}")
+        
+        advice_text = "\n".join(advice_list)
+        
+        user_prompt = f"""
+You are given a list of extracted advice items. For each item:
+1. Decide if it's a valid, standalone piece of advice (actionable tip someone could follow)
+2. If valid, improve the formatting and capitalization to make it clear and professional
+
+Return JSON only (no markdown), in this exact schema:
+{{
+    "items": [
+        {{"index": original_index, "advice": "improved advice text", "keep": true}},
+        {{"index": original_index, "advice": "", "keep": false}}
+    ]
+}}
+
+Rules for KEEP=TRUE (valid advice):
+- Must be actionable and specific
+- Should make sense as standalone advice
+- Contains clear instructions or recommendations
+- Not just questions, complaints, or personal anecdotes
+
+Rules for FORMATTING (when keep=true):
+- Fix capitalization and punctuation
+- Make sentences complete and clear
+- Remove redundant words or awkward phrasing
+- Keep the core meaning intact
+- Start with capital letter, end with period if sentence
+- Replace single quotes with double quotes if needed
+
+INVALID examples (keep=false):
+- "I don't know what to do"
+- "Anyone else have this problem?"
+- "This happened to me"
+- Incomplete fragments that don't give advice
+
+VALID examples (keep=true, with formatting):
+- "Set a consistent bedtime routine to improve sleep quality."
+- "Try the 5-minute rule: commit to doing a task for just 5 minutes."
+
+Advice items to process:
+{advice_text}
+"""
+        
+        completion = prompt_ai(
+            client,
+            messages=[
+                {"role": "system", "content": "You are a careful content filter and formatter. Output must be strictly valid JSON. Start response with '{' and end with '}'."},
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        
+        if not completion or not completion.choices:
+            print(f"No completion for batch {i//batch_size + 1}, keeping original")
+            for idx, row in batch.iterrows():
+                filtered_items.append({
+                    "index": idx,
+                    "advice": row['advice'],
+                    "keep": True  # Default to keeping if API fails
+                })
+            continue
+        
+        raw = completion.choices[0].message.content
+        if not raw:
+            print(f"Empty response for batch {i//batch_size + 1}, keeping original")
+            for idx, row in batch.iterrows():
+                filtered_items.append({
+                    "index": idx,
+                    "advice": row['advice'],
+                    "keep": True
+                })
+            continue
+        
+        raw = raw.strip()
+        raw = sanitize_json_string(raw)
+        
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and "items" in parsed:
+                filtered_items.extend(parsed["items"])
+            else:
+                print(f"Invalid JSON structure for batch {i//batch_size + 1}, keeping original")
+                for idx, row in batch.iterrows():
+                    filtered_items.append({
+                        "index": idx,
+                        "advice": row['advice'],
+                        "keep": True
+                    })
+        except Exception as e:
+            print(f"Failed to parse JSON for batch {i//batch_size + 1}: {e}")
+            # Keep original on parse failure
+            for idx, row in batch.iterrows():
+                filtered_items.append({
+                    "index": idx,
+                    "advice": row['advice'],
+                    "keep": True
+                })
+    
+    # Create mapping from original index to processed result
+    result_map = {item["index"]: item for item in filtered_items}
+    
+    # Apply filtering and formatting
+    keep_mask = []
+    formatted_advice = []
+    
+    for idx, row in df.iterrows():
+        if idx in result_map:
+            result = result_map[idx]
+            keep = result.get("keep", True)
+            advice = result.get("advice", row['advice'])
+        else:
+            # Fallback if index not found
+            keep = True
+            advice = row['advice']
+        
+        keep_mask.append(keep)
+        formatted_advice.append(advice)
+    
+    # Filter out rows marked as not advice
+    df_filtered = df[keep_mask].copy()
+    df_filtered['advice'] = [advice for advice, keep in zip(formatted_advice, keep_mask) if keep]
+    
+    kept_count = len(df_filtered)
+    removed_count = len(df) - kept_count
+    
+    print(f"Filtering complete: kept {kept_count} advice items, removed {removed_count}")
+    
+    return df_filtered
+
+def second_processing(data):
+    """
+    Second processing step: regroup clusters, filter non-advice, and format advice
+    """
+    if len(data) == 0:
+        print("No data for second processing")
+        return data
+        
+    client = get_openrouter_client()
+    
+    print("Regrouping clusters with max 30 groups...")
+    regroup_clusters(client, data, max_groups=30)
+    
+    print("Filtering and formatting advice...")
+    data_filtered = filter_and_format_advice(client, data)
+    
+    print(f"Second processing complete: {len(data_filtered)} final advice items")
+    return data_filtered
+
+def process_raw_data_and_save():
+  print("Loading raw data...")
+  raw_data = load_data("raw_data")
+  print(f"Loaded {len(raw_data)} posts")
+  
+  print("Getting OpenRouter client...")
+  client = get_openrouter_client()
+
+  print("Processing data to extract advice...")
+  processed_data = add_advice(client, raw_data)
+  
+  if len(processed_data) > 0:
+      print("Regrouping similar categories...")
+      regroup_clusters(client, processed_data)
+
+      print("Saving processed data...")
+      save_data(processed_data, "processed_data")
+      print(f"Successfully saved {len(processed_data)} pieces of advice")
+  else:
+      print("No advice was extracted. Check your input data and API responses.")
+      
+  print("Processing complete!")
+
+if __name__ == "__main__":
+  # data = load_data("processed_data")
+  # data = second_processing(data)
+
+  # save_data(data, "p2")
+
+  data = load_data("display_final_data")
+
+  data = regroup_clusters(get_openrouter_client(), data, max_groups=25)
+
+  save_data(data, "p3")
