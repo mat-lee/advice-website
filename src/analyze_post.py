@@ -1,4 +1,5 @@
-from webscrape import load_data, save_data
+from webscrape import *
+from database import *
 
 import json
 import re
@@ -14,9 +15,14 @@ from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import umap
 
+PROCESSING_VERSION = 1.0
+
 # FREE_OPENROUTER_MODEL = "mistralai/devstral-small-2505:free" # Super lightweight model
-FREE_OPENROUTER_MODEL = "openrouter/sonoma-dusk-alpha"
+# FREE_OPENROUTER_MODEL = "openrouter/sonoma-dusk-alpha"
+FREE_OPENROUTER_MODEL = "x-ai/grok-4-fast:free"
+
 MAX_CHARS = 10000 # approximately 2500 tokens
+BATCH_SIZE = 10
 
 load_dotenv()
 
@@ -74,6 +80,23 @@ def prompt_ai(client, model=FREE_OPENROUTER_MODEL, messages=None, temperature=0,
     except Exception as e:
         print(f"API Error: {e}")
         return None
+
+def get_alltext(df):
+    """Combine title and body text from a dataframe"""
+    title_text = df['title'].fillna('').astype(str)
+    body_text = df['selftext'].fillna('').astype(str)
+    
+    # Only include title prefix if title exists
+    combined = []
+    for title, body in zip(title_text, body_text):
+        parts = []
+        if title.strip():
+            parts.append(f"title: {title}")
+        if body.strip():
+            parts.append(f"body: {body}")
+        combined.append(". ".join(parts))
+    
+    return pd.Series(combined, index=df.index)
 
 def gather_advice_and_group(client, doc: str):
     """Prompts a model to read text and identify pieces of advice with better error handling."""
@@ -138,179 +161,57 @@ TEXT: {doc_clean[:MAX_CHARS]}
         print(f"Raw output:\n{raw[:500]}...")  # Show first 500 chars
         return {"items": []}
 
-def get_alltext(df):
-    """Combine title and body text from a dataframe"""
-    # Handle missing values better
-    title_text = df['title'].fillna('').astype(str)
-    body_text = df['selftext'].fillna('').astype(str)
-    
-    # Only include title prefix if title exists
-    combined = []
-    for title, body in zip(title_text, body_text):
-        parts = []
-        if title.strip():
-            parts.append(f"title: {title}")
-        if body.strip():
-            parts.append(f"body: {body}")
-        combined.append(". ".join(parts))
-    
-    return pd.Series(combined, index=df.index)
-
-def add_advice(client, raw_data):
-    """Given a dataframe, returns a copy with every piece of advice and grouping"""
-    data = raw_data.copy()
-    print(f"Starting with {len(data)} rows")
+def process_posts_batch(client, posts_df):
+    """Given a dataframe of posts to extract advice, returns a DataFrame with advice extracted"""
+    posts_df = posts_df.copy()
+    print(f"Processing batch of {len(posts_df)} posts...")
 
     # Clean and prepare the text
-    data['alltext'] = get_alltext(data)
-    
-    # Filter out rows with very little text (less than 50 characters)
-    data = data[data['alltext'].str.len() >= 50].copy()
-    print(f"After filtering short texts: {len(data)} rows")
+    posts_df['alltext'] = get_alltext(posts_df)
 
-    # Keep original columns but work with alltext
-    # Don't drop selftext/title yet in case we need them for debugging
+    # Extract advice from each post
+    all_advice = []
 
-    def extract_items(client, text, row_index):
-        """Extract advice items with better error handling and logging"""
-        if not text or len(text.strip()) < 50:
-            return []
-            
-        text = text[:MAX_CHARS]
+    for idx, row in posts_df.iterrows():
         try:
+            text = row['alltext'][:MAX_CHARS]
             parsed = gather_advice_and_group(client, text)
             items = parsed.get("items", [])
-            print(f"Row {row_index}: Found {len(items)} advice items")
-            return items
+            
+            # Create one row per advice item
+            for item in items:
+                if isinstance(item, dict) and 'advice' in item and 'group' in item:
+                    advice_row = {
+                        'id': row['id'],
+                        'title': row['title'],
+                        'subreddit_name_prefixed': row['subreddit_name_prefixed'],
+                        'ups': row['ups'],
+                        'upvote_ratio': row['upvote_ratio'],
+                        'advice': item['advice'],
+                        'group': item['group']
+                    }
+                    all_advice.append(advice_row)
+                        
         except Exception as e:
-            print(f"Error processing row {row_index}: {e}")
-            return []
+            print(f"Error processing post {row['id']}: {e}")
+            continue
 
-    # Add advice grouping with row index for debugging
-    print("Extracting advice from posts...")
-    data["advice_and_group"] = [
-        extract_items(client, text, idx) 
-        for idx, text in enumerate(data["alltext"])
-    ]
-    
-    # Count how many rows have advice
-    has_advice = data["advice_and_group"].apply(lambda x: len(x) > 0 if x else False)
-    print(f"Rows with advice found: {has_advice.sum()}/{len(data)}")
+    advice_df = pd.DataFrame(all_advice)
 
-    # Drop unnecessary columns
-    data.drop(columns=["alltext", "selftext", "title"], inplace=True)
+    print(f"Extracted {len(advice_df)} pieces of advice from batch")
 
-    # Expand each advice/grouping pair per advice post
-    data = data.explode("advice_and_group").reset_index(drop=True)
-    print(f"After exploding advice: {len(data)} rows")
+    return advice_df
 
-    # Drop rows where advice_and_group is empty list or None
-    data = data[data["advice_and_group"].apply(lambda x: x is not None and x != [] and isinstance(x, dict))].copy()
-    print(f"After filtering valid advice: {len(data)} rows")
-
-    if len(data) == 0:
-        print("WARNING: No valid advice found in any posts!")
-        return data
-
-    # Expand dictionary safely
-    data["advice"] = data["advice_and_group"].apply(lambda d: d.get("advice", "") if isinstance(d, dict) else "")
-    data["group"] = data["advice_and_group"].apply(lambda d: d.get("group", "") if isinstance(d, dict) else "")
-
-    # Filter out empty advice
-    data = data[data["advice"].str.len() > 0].copy()
-    print(f"Final advice count: {len(data)} pieces of advice")
-
-    data.drop(columns=["advice_and_group"], inplace=True)
-
-    return data
-
-def regroup_clusters(client, df, max_groups=None):
-    """Given a dataframe, modifies the data inplace and regroups the groupings"""
-    if len(df) == 0:
-        print("No data to regroup")
-        return df
+def regroup_clusters(client, max_groups=None):
+    """Regroup existing advice in database using API"""
+    print("Loading advice for regrouping...")
+    advice_df = get_all_advice()
         
     # Get label counts to help the model choose canonical names
-    counts = df['group'].value_counts().to_dict()
+    counts = advice_df['group_name'].value_counts().to_dict()
     print(f"Original groups: {counts}")
 
-    constraint = (
-        f"\nIMPORTANT: Ensure the total number of DISTINCT output values is at most {max_groups}. "
-        f"You currently have {len(counts)} groups and need to reduce to {max_groups} or fewer."
-        if max_groups else ""
-    )
-
-    # Build a small prompt
-    user_prompt = f"""
-You are given a list of existing group labels with their frequencies.
-Return a JSON object that maps EACH old label to ONE consolidated canonical label.
-Keep labels short (1-3 words). Merge synonyms/redundant labels into a single canonical label.
-Output JSON only, no markdown or commentary.{constraint}
-
-Example:
-Input counts: {{"Sleep": 42, "Sleep Schedule": 20, "Reading": 10}}
-Output: {{"Sleep":"Sleep", "Sleep Schedule":"Sleep", "Reading":"Reading"}}
-
-Input counts:
-{counts}
-"""
-
-    # Call the LLM
-    completion = prompt_ai(
-        client,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-
-    if not completion or not completion.choices:
-        print("Failed to get regrouping response, keeping original groups")
-        return df
-
-    raw = completion.choices[0].message.content
-    if not raw:
-        print("Empty regrouping response, keeping original groups")  
-        return df
-        
-    raw = raw.strip()
-    raw = sanitize_json_string(raw)
-
-    # Try parsing JSON safely
-    try:
-        mapping = json.loads(raw)
-        print(f"Group mapping: {mapping}")
-    except Exception as e:
-        print(f"Failed to parse regrouping JSON: {e}")
-        print(f"Raw output:\n{raw}")
-        return df
-
-    # Remap groupings
-    df['group'] = df['group'].map(lambda g: mapping.get(g, g))
-    
-    # Show final groups
-    final_counts = df['group'].value_counts().to_dict()
-    print(f"Final groups: {final_counts}")
-
-    return df
-
-def regroup_clusters(client, df, max_groups=None):
-    """
-    Improved version with better debugging and error handling
-    """
-    if len(df) == 0:
-        print("No data to regroup")
-        return df
-    
-    # Make a copy to avoid modifying original
-    df = df.copy()
-        
-    # Get label counts to help the model choose canonical names
-    counts = df['group'].value_counts().to_dict()
-    print(f"Original groups ({len(counts)} total): {counts}")
-
-    # If we already have few enough groups, skip regrouping
-    if max_groups and len(counts) <= max_groups:
-        print(f"Already have {len(counts)} groups, which is <= {max_groups}. Skipping regrouping.")
-        return df
-    
+    # ----- Prompt Engineering -----
     # Base examples (always included)
     examples = """
 Examples of required consolidation from your data:
@@ -348,83 +249,63 @@ Return JSON mapping each input to its consolidated category:
     # Call the LLM
     completion = prompt_ai(
         client,
-        messages=[
-            {"role": "system", "content": "You are a label consolidation expert. Return only valid JSON mapping old labels to new canonical labels."},
-            {"role": "user", "content": user_prompt}
-        ],
+        messages=[{"role": "user", "content": user_prompt}],
     )
 
     if not completion or not completion.choices:
         print("Failed to get regrouping response, keeping original groups")
-        return df
+        return 0
 
     raw = completion.choices[0].message.content
     if not raw:
         print("Empty regrouping response, keeping original groups")  
-        return df
+        return 0
         
     raw = raw.strip()
     raw = sanitize_json_string(raw)
-    print(f"Raw API response: {raw[:200]}...")  # Debug print
 
     # Try parsing JSON safely
     try:
         mapping = json.loads(raw)
-        print(f"Parsed mapping: {mapping}")
-        
-        # Validate that all original groups are in the mapping
-        missing_keys = set(counts.keys()) - set(mapping.keys())
-        if missing_keys:
-            print(f"Warning: Missing mappings for groups: {missing_keys}")
-            # Add identity mappings for missing keys
-            for key in missing_keys:
-                mapping[key] = key
 
-        # Count unique output values
         unique_outputs = len(set(mapping.values()))
         print(f"Mapping creates {unique_outputs} unique output groups")
 
         if max_groups and unique_outputs > max_groups * 1.2:  # Allow 20% over target
             print(f"WARNING: AI didn't consolidate enough! Got {unique_outputs}, wanted {max_groups}")
-            # You could add fallback logic here
-                
+
+        updated_count = update_advice_groups(mapping)
+
+        new_advice_df = get_all_advice()
+        new_counts = new_advice_df['group_name'].value_counts().to_dict()
+
+        print(f"Regrouping complete: {len(counts)} → {len(new_counts)}")
+
+        return updated_count # Number of rows updated
+
     except Exception as e:
         print(f"Failed to parse regrouping JSON: {e}")
-        print(f"Raw output:\n{raw}")
-        return df
+        return 0
 
-    # Apply the mapping
-    original_groups = df['group'].value_counts()
-    df['group'] = df['group'].map(lambda g: mapping.get(g, g))
-    
-    # Show results
-    final_counts = df['group'].value_counts().to_dict()
-    print(f"Final groups ({len(final_counts)} total): {final_counts}")
-    print(f"Reduced from {len(original_groups)} to {len(final_counts)} groups")
-
-    return df
-
-def filter_and_format_advice(client, df):
+def filter_advice(client, batch_size=50):
     """
-    Filter out rows that don't contain standalone advice and fix formatting/capitalization
+    Filter out rows that don't contain standalone advice
     """
-    if len(df) == 0:
-        print("No data to filter and format")
-        return df
+    print("Loading advice to filter...")
+    advice_df = get_all_advice()
     
-    print(f"Starting filtering and formatting with {len(df)} advice items")
+    print(f"Starting filtering and formatting with {len(advice_df)} advice items")
     
     # Process advice in batches to avoid token limits
-    batch_size = 20
-    filtered_items = []
+    total_invalidated = 0
     
-    for i in range(0, len(df), batch_size):
-        batch = df.iloc[i:i + batch_size]
+    for i in range(0, len(advice_df), batch_size):
+        batch = advice_df.iloc[i:i + batch_size]
         
         # Create list of advice items for the batch
         advice_list = []
         for idx, row in batch.iterrows():
-            advice_list.append(f"{idx}: {row['advice']}")
+            advice_list.append(f"{row['id']}: {row['advice']}")
         
         advice_text = "\n".join(advice_list)
         
@@ -479,23 +360,10 @@ Advice items to process:
         
         if not completion or not completion.choices:
             print(f"No completion for batch {i//batch_size + 1}, keeping original")
-            for idx, row in batch.iterrows():
-                filtered_items.append({
-                    "index": idx,
-                    "advice": row['advice'],
-                    "keep": True  # Default to keeping if API fails
-                })
             continue
         
         raw = completion.choices[0].message.content
         if not raw:
-            print(f"Empty response for batch {i//batch_size + 1}, keeping original")
-            for idx, row in batch.iterrows():
-                filtered_items.append({
-                    "index": idx,
-                    "advice": row['advice'],
-                    "keep": True
-                })
             continue
         
         raw = raw.strip()
@@ -503,107 +371,85 @@ Advice items to process:
         
         try:
             parsed = json.loads(raw)
-            if isinstance(parsed, dict) and "items" in parsed:
-                filtered_items.extend(parsed["items"])
-            else:
-                print(f"Invalid JSON structure for batch {i//batch_size + 1}, keeping original")
-                for idx, row in batch.iterrows():
-                    filtered_items.append({
-                        "index": idx,
-                        "advice": row['advice'],
-                        "keep": True
-                    })
+            invalid_ids = parsed.get("invalid_ids", [])
+
+            if invalid_ids:
+                invalidated = invalidate_advice(invalid_ids)
+                total_invalidated += invalidated
+                print(f"Batch {i//batch_size + 1}: Invalidated {invalidated} items")
+
         except Exception as e:
-            print(f"Failed to parse JSON for batch {i//batch_size + 1}: {e}")
-            # Keep original on parse failure
-            for idx, row in batch.iterrows():
-                filtered_items.append({
-                    "index": idx,
-                    "advice": row['advice'],
-                    "keep": True
-                })
+            print(f"Error processing batch {i//batch_size + 1}: {e}")
     
-    # Create mapping from original index to processed result
-    result_map = {item["index"]: item for item in filtered_items}
-    
-    # Apply filtering and formatting
-    keep_mask = []
-    formatted_advice = []
-    
-    for idx, row in df.iterrows():
-        if idx in result_map:
-            result = result_map[idx]
-            keep = result.get("keep", True)
-            advice = result.get("advice", row['advice'])
-        else:
-            # Fallback if index not found
-            keep = True
-            advice = row['advice']
-        
-        keep_mask.append(keep)
-        formatted_advice.append(advice)
-    
-    # Filter out rows marked as not advice
-    df_filtered = df[keep_mask].copy()
-    df_filtered['advice'] = [advice for advice, keep in zip(formatted_advice, keep_mask) if keep]
-    
-    kept_count = len(df_filtered)
-    removed_count = len(df) - kept_count
-    
-    print(f"Filtering complete: kept {kept_count} advice items, removed {removed_count}")
-    
-    return df_filtered
+    print(f"Filtering complete: invalidated {total_invalidated} non-advice items")
 
-def second_processing(data):
+    return total_invalidated
+
+def process_unprocessed_posts(client, batch_size=BATCH_SIZE):
     """
-    Second processing step: regroup clusters, filter non-advice, and format advice
+    Main processing function: get unprocessed posts and extract advice
     """
-    if len(data) == 0:
-        print("No data for second processing")
-        return data
+    init_database()
+    
+    processed_count = 0
+    batch_num = 0
+    
+    while True:
+        # Get next batch of unprocessed posts
+        unprocessed_posts = get_unprocessed_posts(limit=batch_size)
         
+        if len(unprocessed_posts) == 0:
+            print("No more unprocessed posts found")
+            break
+        
+        batch_num += 1
+        post_ids = unprocessed_posts['id'].tolist()
+        
+        print(f"\n--- Batch {batch_num}: Processing {len(unprocessed_posts)} posts ---")
+        
+        try: 
+            # Process the batch
+            advice_df = process_posts_batch(client, unprocessed_posts)
+            
+            if len(advice_df) > 0:
+                # Save advice to database
+                saved_count = save_advice_to_db(advice_df)
+                print(f"Saved {saved_count} advice items to database")
+            
+            # Mark as completed
+            mark_posts_completed(post_ids, PROCESSING_VERSION, FREE_OPENROUTER_MODEL)
+            processed_count += len(unprocessed_posts)
+            
+            print(f"Batch {batch_num} completed successfully")
+            
+        except Exception as e:
+            print(f"Error processing batch {batch_num}: {e}")
+            mark_posts_failed(post_ids, PROCESSING_VERSION, FREE_OPENROUTER_MODEL, str(e))
+            continue
+    
+    print(f"\nProcessing complete! Processed {processed_count} posts in {batch_num} batches")
+    return processed_count
+
+def run_full_analysis_pipeline():
+    """
+    Run the complete analysis pipeline
+    """
+    print("=== STARTING FULL ANALYSIS PIPELINE ===\n")
+    
     client = get_openrouter_client()
+
+    # Step 1: Process unprocessed posts
+    print("Step 1: Processing unprocessed posts...")
+    processed_count = process_unprocessed_posts(client)
     
-    print("Regrouping clusters with max 30 groups...")
-    regroup_clusters(client, data, max_groups=30)
+    if processed_count == 0:
+        print("No posts were processed, skipping remaining steps")
+        return
     
-    print("Filtering and formatting advice...")
-    data_filtered = filter_and_format_advice(client, data)
+    # Step 2: Regroup advice clusters
+    print("\nStep 2: Regrouping advice clusters...")
+    regroup_clusters(client, max_groups=25)
     
-    print(f"Second processing complete: {len(data_filtered)} final advice items")
-    return data_filtered
-
-def process_raw_data_and_save():
-  print("Loading raw data...")
-  raw_data = load_data("raw_data")
-  print(f"Loaded {len(raw_data)} posts")
-  
-  print("Getting OpenRouter client...")
-  client = get_openrouter_client()
-
-  print("Processing data to extract advice...")
-  processed_data = add_advice(client, raw_data)
-  
-  if len(processed_data) > 0:
-      print("Regrouping similar categories...")
-      regroup_clusters(client, processed_data)
-
-      print("Saving processed data...")
-      save_data(processed_data, "processed_data")
-      print(f"Successfully saved {len(processed_data)} pieces of advice")
-  else:
-      print("No advice was extracted. Check your input data and API responses.")
-      
-  print("Processing complete!")
-
-if __name__ == "__main__":
-  # data = load_data("processed_data")
-  # data = second_processing(data)
-
-  # save_data(data, "p2")
-
-  data = load_data("display_final_data")
-
-  data = regroup_clusters(get_openrouter_client(), data, max_groups=25)
-
-  save_data(data, "p3")
+    # Step 3: Filter invalid advice
+    print("\nStep 3: Filtering invalid advice...")
+    filter_advice(client)
