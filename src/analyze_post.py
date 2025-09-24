@@ -15,11 +15,12 @@ from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import umap
 
-PROCESSING_VERSION = 1.0
+PROCESSING_VERSION = 1.1
 
 # FREE_OPENROUTER_MODEL = "mistralai/devstral-small-2505:free" # Super lightweight model
 # FREE_OPENROUTER_MODEL = "openrouter/sonoma-dusk-alpha"
 FREE_OPENROUTER_MODEL = "x-ai/grok-4-fast:free"
+FREE_OPENROUTER_MODEL = "deepseek/deepseek-chat-v3.1:free"
 
 MAX_CHARS = 10000 # approximately 2500 tokens
 BATCH_SIZE = 10
@@ -117,7 +118,7 @@ Return JSON only (no markdown/extras), exactly in this schema:
 }}
 
 Rules:
-- "advice": a verbatim substring of TEXT that is a self-contained actionable tip. It may be as long as necessary to convey the point.
+- "advice": a verbatim substring of TEXT that is a self-contained actionable tip. It may be as long as necessary to convey the point. It should make sense standalone. It should be quotable.
 - Replace all double quotes in advice text with single quotes
 - "group": a short label (≤3 words) describing the theme of that advice.
 - Every "advice" must make complete sense on its own
@@ -209,7 +210,6 @@ def regroup_clusters(client, max_groups=None):
         
     # Get label counts to help the model choose canonical names
     counts = advice_df['group_name'].value_counts().to_dict()
-    print(f"Original groups: {counts}")
 
     # ----- Prompt Engineering -----
     # Base examples (always included)
@@ -287,7 +287,7 @@ Return JSON mapping each input to its consolidated category:
         print(f"Failed to parse regrouping JSON: {e}")
         return 0
 
-def filter_advice(client, batch_size=50):
+def filter_advice(client, batch_size=25):
     """
     Filter out rows that don't contain standalone advice
     """
@@ -305,41 +305,26 @@ def filter_advice(client, batch_size=50):
         # Create list of advice items for the batch
         advice_list = []
         for idx, row in batch.iterrows():
-            advice_list.append(f"{row['id']}: {row['advice']}")
+            advice_list.append(f"{row['advice_id']}: {row['advice_text']}")
         
         advice_text = "\n".join(advice_list)
         
         user_prompt = f"""
-You are given a list of extracted advice items. For each item:
-1. Decide if it's a valid, standalone piece of advice (actionable tip someone could follow)
-2. If valid, improve the formatting and capitalization to make it clear and professional
+Review these advice items and identify which ones are NOT actually actionable advice.
 
-Return JSON only (no markdown), in this exact schema:
-{{
-    "items": [
-        {{"index": original_index, "advice": "improved advice text", "keep": true}},
-        {{"index": original_index, "advice": "", "keep": false}}
-    ]
-}}
+Return JSON with advice_ids that should be marked as invalid:
+{{"invalid_ids": [123, 456, 789]}}
 
-Rules for KEEP=TRUE (valid advice):
-- Must be actionable and specific
-- Should make sense as standalone advice
-- Contains clear instructions or recommendations
-- Not just questions, complaints, or personal anecdotes
+Mark as INVALID if the text is:
+- Not actionable and specific
+- Doesn't make sense standalone
+- Doesn't contain clear advice or instruction or recommendation
 
-Rules for FORMATTING (when keep=true):
-- Fix capitalization and punctuation
-- Make sentences complete and clear
-- Remove redundant words or awkward phrasing
-- Keep the core meaning intact
-- Start with capital letter, end with period if sentence
-- Replace single quotes with double quotes if needed
-
-INVALID examples (keep=false):
-- "I don't know what to do"
-- "Anyone else have this problem?"
-- "This happened to me"
+INVALID Examples
+- "Do the fucking thing"
+- "pay that month's bill manually"
+- "Turn off notifications"
+- "I would 1000% suggest reading her book"
 - Incomplete fragments that don't give advice
 
 VALID examples (keep=true, with formatting):
@@ -430,26 +415,47 @@ def process_unprocessed_posts(client, batch_size=BATCH_SIZE):
     print(f"\nProcessing complete! Processed {processed_count} posts in {batch_num} batches")
     return processed_count
 
-def run_full_analysis_pipeline():
+def process_outdated_advice_posts(client, batch_size=BATCH_SIZE):
     """
-    Run the complete analysis pipeline
+    Reprocess posts that used an older processing version.
     """
-    print("=== STARTING FULL ANALYSIS PIPELINE ===\n")
+    init_database()
     
-    client = get_openrouter_client()
-
-    # Step 1: Process unprocessed posts
-    print("Step 1: Processing unprocessed posts...")
-    processed_count = process_unprocessed_posts(client)
+    processed_count = 0
+    batch_num = 0
     
-    if processed_count == 0:
-        print("No posts were processed, skipping remaining steps")
-        return
+    while True:
+        # Get next batch of unprocessed posts
+        outdated_posts = get_outdated_advice_posts(PROCESSING_VERSION, limit=batch_size)
+        
+        if len(outdated_posts) == 0:
+            print("No outdated posts found")
+            break
+        
+        batch_num += 1
+        post_ids = outdated_posts['id'].tolist()
+        
+        print(f"\n--- Batch {batch_num}: Processing {len(outdated_posts)} posts ---")
+        
+        try: 
+            # Process the batch
+            advice_df = process_posts_batch(client, outdated_posts)
+            
+            if len(advice_df) > 0:
+                # Save advice to database
+                saved_count = save_advice_to_db(advice_df)
+                print(f"Saved {saved_count} advice items to database")
+            
+            # Mark as completed
+            mark_posts_completed(post_ids, PROCESSING_VERSION, FREE_OPENROUTER_MODEL)
+            processed_count += len(outdated_posts)
+            
+            print(f"Batch {batch_num} completed successfully")
+            
+        except Exception as e:
+            print(f"Error processing batch {batch_num}: {e}")
+            mark_posts_failed(post_ids, PROCESSING_VERSION, FREE_OPENROUTER_MODEL, str(e))
+            continue
     
-    # Step 2: Regroup advice clusters
-    print("\nStep 2: Regrouping advice clusters...")
-    regroup_clusters(client, max_groups=25)
-    
-    # Step 3: Filter invalid advice
-    print("\nStep 3: Filtering invalid advice...")
-    filter_advice(client)
+    print(f"\nProcessing complete! Processed {processed_count} posts in {batch_num} batches")
+    return processed_count

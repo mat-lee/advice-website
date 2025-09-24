@@ -107,7 +107,7 @@ def get_unprocessed_posts(limit=None):
     with get_db_connection() as conn:
         return pd.read_sql(query, conn)
 
-def get_outdated_advice_posts(processing_version):
+def get_outdated_advice_posts(processing_version, limit=None):
     """Get posts with advice processed by older model versions"""
     query = '''
     SELECT p.* FROM posts p
@@ -115,6 +115,9 @@ def get_outdated_advice_posts(processing_version):
     WHERE ps.status = 'completed' AND ps.processing_version < ?
     ORDER BY p.ups DESC, p.scraped_at ASC
     '''
+
+    if limit:
+        query += f" LIMIT {limit}"
     
     with get_db_connection() as conn:
         return pd.read_sql(query, conn, params=(processing_version,))
