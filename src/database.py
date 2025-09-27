@@ -28,6 +28,7 @@ def init_database():
             post_id TEXT REFERENCES posts(id),
             advice_text TEXT,
             group_name TEXT,
+            regroup_name TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             is_valid BOOLEAN DEFAULT TRUE
         );
@@ -40,6 +41,16 @@ def init_database():
             model_name TEXT,
             last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             error_message TEXT
+        );
+
+        -- Advice score tracking
+        CREATE TABLE IF NOT EXISTS advice_quality_scores (
+            advice_id INTEGER PRIMARY KEY REFERENCES advice(advice_id),
+            clarity REAL, 
+            objective REAL,
+            practicality REAL,
+            quality_score REAL,
+            scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
         -- Create indexes for better performance
@@ -122,6 +133,27 @@ def get_outdated_advice_posts(processing_version, limit=None):
     with get_db_connection() as conn:
         return pd.read_sql(query, conn, params=(processing_version,))
 
+def get_unscored_advice():
+    """Get all valid advice that doesn't have quality scores yet"""
+    with get_db_connection() as conn:
+        return pd.read_sql('''
+        SELECT 
+            a.advice_id,
+            a.post_id,
+            a.advice_text,
+            a.group_name,
+            a.created_at,
+            p.title,
+            p.ups,
+            p.upvote_ratio,
+            p.subreddit_name_prefixed
+        FROM advice a
+        JOIN posts p ON a.post_id = p.id
+        LEFT JOIN advice_quality_scores q ON a.advice_id = q.advice_id
+        WHERE a.is_valid = TRUE AND q.advice_id IS NULL
+        ORDER BY p.ups DESC, a.created_at DESC
+        ''', conn)
+
 def mark_posts_completed(post_ids, processing_version, model_name):
     """Mark posts as successfully processed"""
     if not post_ids:
@@ -168,6 +200,9 @@ def save_advice_to_db(advice_df):
     # Prepare advice data for insertion
     advice_data = advice_df[['id', 'advice', 'group']].copy()
     advice_data.columns = ['post_id', 'advice_text', 'group_name']
+
+    # Add regroup name as a copy of the group_name
+    advice_data["regroup_name"] = advice_data["group_name"]
     
     with get_db_connection() as conn:
         # Get unique post IDs that we're about to process
@@ -189,9 +224,25 @@ def save_advice_to_db(advice_df):
         conn.commit()
         
         return len(advice_data)
+
+def save_quality_scores_to_db(scores_df):
+    """Save quality scores to database"""
+    if len(scores_df) == 0:
+        return
     
+    with get_db_connection() as conn:
+        # Clear existing scores for these advice items
+        advice_ids = scores_df['advice_id'].tolist()
+        if advice_ids:
+            placeholders = ','.join(['?' for _ in advice_ids])
+            conn.execute(f'DELETE FROM advice_quality_scores WHERE advice_id IN ({placeholders})', advice_ids)
+        
+        # Insert new scores
+        scores_df.to_sql('advice_quality_scores', conn, if_exists='append', index=False)
+        conn.commit()
+
 def update_advice_groups(group_mapping):
-    """Update advice group names based on mapping"""
+    """Update advice (re)group names based on mapping"""
     if not group_mapping:
         return 0
         
@@ -200,8 +251,8 @@ def update_advice_groups(group_mapping):
         for old_group, new_group in group_mapping.items():
             result = conn.execute('''
             UPDATE advice 
-            SET group_name = ? 
-            WHERE group_name = ?
+            SET regroup_name = ? 
+            WHERE regroup_name = ?
             ''', (new_group, old_group))
             updated_count += result.rowcount
         conn.commit()
@@ -243,6 +294,7 @@ def get_all_advice():
             a.post_id,
             a.advice_text,
             a.group_name,
+            a.regroup_name,
             a.created_at,
             p.title,
             p.ups,
@@ -254,21 +306,30 @@ def get_all_advice():
         ORDER BY p.ups DESC, a.created_at DESC
         ''', conn)
 
-def export_advice_to_csv(filename):
+def export_advice_to_csv(filename, quality_threshold=0.0):
     """Export advice in a clean format optimized for website display"""
     with get_db_connection() as conn:
         df = pd.read_sql('''
         SELECT 
             a.advice_text as advice,
-            a.group_name as category,
+            a.group_name as old_category,
+            a.regroup_name as category,
+            p.id as id,
             p.ups as upvotes,
             p.upvote_ratio as upvote_ratio,
-            p.subreddit_name_prefixed as subreddit
+            p.subreddit_name_prefixed as subreddit,
+            s.clarity as clarity_score,
+            s.objective as objective_score,
+            s.practicality as practicality_score,
+            s.quality_score as quality_score
         FROM advice a
         JOIN posts p ON a.post_id = p.id
-        WHERE a.is_valid = TRUE
-        ORDER BY a.group_name, p.ups DESC
-        ''', conn)
+        JOIN advice_quality_scores s ON s.advice_id = a.advice_id
+        WHERE a.is_valid = TRUE 
+            AND s.quality_score >= ?
+            AND a.regroup_name <> ?
+        ORDER BY a.regroup_name, p.ups DESC
+        ''', conn, params=[quality_threshold, "Addiction"])
     
     if len(df) == 0:
         print("No advice to export")

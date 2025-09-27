@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect } from 'react';
-import { Search, ChevronUp, ChevronDown, RotateCcw, AlertCircle, Loader, Copy, ExternalLink } from 'lucide-react';
+import { Search, ChevronUp, ChevronDown, RotateCcw, AlertCircle, Loader, Copy } from 'lucide-react';
 import Papa from 'papaparse';
 
 function AdviceAggregator() {
@@ -9,7 +9,7 @@ function AdviceAggregator() {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedGroup, setSelectedGroup] = useState('');
   const [selectedSubreddit, setSelectedSubreddit] = useState('');
-  const [sortBy, setSortBy] = useState('ups');
+  const [sortBy, setSortBy] = useState('quality_score');
   const [sortOrder, setSortOrder] = useState('desc');
   const [hoveredItem, setHoveredItem] = useState(null);
   const [defaultGroupSet, setDefaultGroupSet] = useState(false);
@@ -21,9 +21,8 @@ function AdviceAggregator() {
   const mkKey = (row, i) => {
     const s = [
       row.id ?? '',
-      row.permalink ?? '',
-      row.subreddit_name_prefixed ?? '',
-      row.group ?? '',
+      row.subreddit ?? '',
+      row.category ?? '',
       row.advice ?? '',
       i
     ].join('|');
@@ -45,8 +44,9 @@ function AdviceAggregator() {
           skipEmptyLines: true,
           dynamicTyping: true,
           transform: (value, field) => {
-            if (field === 'ups') return parseInt(value) || 0;
+            if (field === 'upvotes') return parseInt(value) || 0;
             if (field === 'upvote_ratio') return parseFloat(value) || 0;
+            if (field === 'quality_score') return parseFloat(value) || 0;
             if (typeof value === 'string') return value.trim();
             return value;
           },
@@ -56,8 +56,8 @@ function AdviceAggregator() {
             );
             const normalized = validData.map((row, i) => ({
               ...row,
-              group_norm: norm(row.group),
-              subreddit_norm: norm(row.subreddit_name_prefixed),
+              category_norm: norm(row.category),
+              subreddit_norm: norm(row.subreddit),
               advice_norm: norm(row.advice),
               __key: mkKey(row, i),
             }));            
@@ -82,8 +82,8 @@ function AdviceAggregator() {
   const groupOptions = useMemo(() => {
     const byNorm = new Map();
     for (const item of adviceData) {
-      if (!item.group_norm) continue;
-      if (!byNorm.has(item.group_norm)) byNorm.set(item.group_norm, item.group?.trim() || 'Uncategorized');
+      if (!item.category_norm) continue;
+      if (!byNorm.has(item.category_norm)) byNorm.set(item.category_norm, item.category?.trim() || 'Uncategorized');
     }
     return Array.from(byNorm.entries()).map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label));
   }, [adviceData]);
@@ -100,7 +100,7 @@ function AdviceAggregator() {
     const byNorm = new Map();
     for (const item of adviceData) {
       if (!item.subreddit_norm) continue;
-      if (!byNorm.has(item.subreddit_norm)) byNorm.set(item.subreddit_norm, item.subreddit_name_prefixed?.trim() || 'Unknown');
+      if (!byNorm.has(item.subreddit_norm)) byNorm.set(item.subreddit_norm, item.subreddit?.trim() || 'Unknown');
     }
     return Array.from(byNorm.entries()).map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label));
   }, [adviceData]);
@@ -117,13 +117,13 @@ function AdviceAggregator() {
       data = data.filter(
         (item) =>
           item.advice_norm.includes(s) ||
-          item.group_norm.includes(s) ||
+          item.category_norm.includes(s) ||
           item.subreddit_norm.includes(s)
       );
     }
 
     if (selectedGroup) {
-      data = data.filter((item) => item.group_norm === selectedGroup);
+      data = data.filter((item) => item.category_norm === selectedGroup);
     }
 
     if (selectedSubreddit) {
@@ -136,8 +136,8 @@ function AdviceAggregator() {
       let aValue = a[sortBy];
       let bValue = b[sortBy];
 
-      if (aValue == null) aValue = sortBy === 'ups' ? 0 : sortBy === 'upvote_ratio' ? 0 : '';
-      if (bValue == null) bValue = sortBy === 'ups' ? 0 : sortBy === 'upvote_ratio' ? 0 : '';
+      if (aValue == null) aValue = sortBy === 'upvotes' ? 0 : sortBy === 'upvote_ratio' ? 0 : '';
+      if (bValue == null) bValue = sortBy === 'upvotes' ? 0 : sortBy === 'upvote_ratio' ? 0 : '';
 
       if (typeof aValue === 'string') {
         aValue = aValue.toLowerCase();
@@ -242,9 +242,10 @@ function AdviceAggregator() {
                 onChange={(e) => setSortBy(e.target.value)}
                 className="px-3 py-2 border border-gray-300 rounded-l-md text-sm focus:outline-none focus:ring-2 focus:ring-gray-900 focus:border-transparent"
               >
-                <option value="ups">Popularity</option>
+                <option value="upvotes">Popularity</option>
                 <option value="upvote_ratio">Quality</option>
-                <option value="group">Category</option>
+                <option value="quality_score">AI Quality</option>
+                <option value="category">Category</option>
               </select>
               <button
                 onClick={() => setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc')}
@@ -308,18 +309,6 @@ function AdviceAggregator() {
                   >
                     <Copy className="w-3 h-3" />
                   </button>
-                  {item.permalink && (
-                    <a
-                      href={`https://reddit.com${item.permalink}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="p-1 hover:text-gray-900 transition-colors"
-                      title="View on Reddit"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
-                  )}
                 </div>
               </div>
 
@@ -328,22 +317,10 @@ function AdviceAggregator() {
                 <div className="absolute right-4 top-2 bg-black text-white text-xs px-3 py-2 rounded shadow-lg z-20 min-w-48">
                   <div className="space-y-1">
                     <div><strong>ID:</strong> {item.id || 'N/A'}</div>
-                    <div><strong>Source:</strong> {item.subreddit_name_prefixed || 'Unknown'}</div>
-                    <div><strong>Upvotes:</strong> {formatNumber(item.ups)}</div>
+                    <div><strong>Source:</strong> {item.subreddit || 'Unknown'}</div>
+                    <div><strong>Upvotes:</strong> {formatNumber(item.upvotes)}</div>
                     <div><strong>Quality:</strong> {Math.round((item.upvote_ratio || 0) * 100)}% positive</div>
-                    {item.permalink && (
-                      <div>
-                        <a 
-                          href={`https://reddit.com${item.permalink}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-300 hover:text-blue-100 underline"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          View Post →
-                        </a>
-                      </div>
-                    )}
+                    <div><strong>AI Quality:</strong> {((item.quality_score || 0) * 100).toFixed(0)}%</div>
                   </div>
                 </div>
               )}

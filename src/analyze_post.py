@@ -4,6 +4,7 @@ from database import *
 import json
 import re
 import os
+import statistics
 import time
 
 from dotenv import load_dotenv
@@ -13,6 +14,7 @@ from openai import OpenAI
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+from sklearn.metrics.pairwise import cosine_similarity
 import umap
 
 PROCESSING_VERSION = 1.1
@@ -20,7 +22,7 @@ PROCESSING_VERSION = 1.1
 # FREE_OPENROUTER_MODEL = "mistralai/devstral-small-2505:free" # Super lightweight model
 # FREE_OPENROUTER_MODEL = "openrouter/sonoma-dusk-alpha"
 FREE_OPENROUTER_MODEL = "x-ai/grok-4-fast:free"
-FREE_OPENROUTER_MODEL = "deepseek/deepseek-chat-v3.1:free"
+# FREE_OPENROUTER_MODEL = "deepseek/deepseek-chat-v3.1:free"
 
 MAX_CHARS = 10000 # approximately 2500 tokens
 BATCH_SIZE = 10
@@ -46,6 +48,9 @@ def get_openrouter_client():
     )
 
     return client
+
+def get_sentence_transformer():
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
 def sanitize_json_string(raw: str) -> str:
     """More robust JSON cleaning"""
@@ -203,13 +208,18 @@ def process_posts_batch(client, posts_df):
 
     return advice_df
 
-def regroup_clusters(client, max_groups=None):
-    """Regroup existing advice in database using API"""
-    print("Loading advice for regrouping...")
+def regroup_clusters_batch(client, batch_size, target_groups):
+    """Regroup a batch of categories."""
     advice_df = get_all_advice()
-        
-    # Get label counts to help the model choose canonical names
-    counts = advice_df['group_name'].value_counts().to_dict()
+    
+    # Get smallest groups first (ascending=True) up to batch_size
+    group_counts = advice_df['regroup_name'].value_counts(ascending=True)[:batch_size].to_dict()
+    
+    if not group_counts:
+        print("No groups to process")
+        return 0
+
+    print(f"Processing batch of {len(group_counts)} groups")
 
     # ----- Prompt Engineering -----
     # Base examples (always included)
@@ -222,9 +232,9 @@ Examples of required consolidation from your data:
 """
     
     # Conditional constraint
-    if max_groups:
+    if target_groups:
         constraint = f"""
-CRITICAL TARGET: You must reduce {len(counts)} groups down to {max_groups} or fewer groups.
+CRITICAL TARGET: You must reduce {len(group_counts)} groups down to {target_groups} or fewer groups.
 This means MANY input labels must map to the SAME output labels. Be very aggressive in merging.
 """
     else:
@@ -234,13 +244,13 @@ GOAL: Consolidate similar/synonymous groups into canonical categories to reduce 
     
     # Build prompt
     user_prompt = f"""
-You have {len(counts)} group labels that need consolidation.
+You have {len(group_counts)} group labels that need consolidation.
 
 {constraint}
 
 {examples}
 
-Current labels: {list(counts.keys())}
+Current labels: {list(group_counts.keys())}
 
 Return JSON mapping each input to its consolidated category:
 {{"input_label": "canonical_category", ...}}
@@ -252,123 +262,89 @@ Return JSON mapping each input to its consolidated category:
         messages=[{"role": "user", "content": user_prompt}],
     )
 
-    if not completion or not completion.choices:
-        print("Failed to get regrouping response, keeping original groups")
-        return 0
-
-    raw = completion.choices[0].message.content
-    if not raw:
-        print("Empty regrouping response, keeping original groups")  
+    if not completion or not completion.choices or not completion.choices[0].message.content:
+        print("Failed to get AI response")
         return 0
         
-    raw = raw.strip()
-    raw = sanitize_json_string(raw)
+    raw_response = completion.choices[0].message.content.strip()
+    sanitized_response = sanitize_json_string(raw_response)
 
     # Try parsing JSON safely
     try:
-        mapping = json.loads(raw)
+        mapping = json.loads(sanitized_response)
 
         unique_outputs = len(set(mapping.values()))
-        print(f"Mapping creates {unique_outputs} unique output groups")
+        # print(f"Mapping creates {unique_outputs} unique output groups")
 
-        if max_groups and unique_outputs > max_groups * 1.2:  # Allow 20% over target
-            print(f"WARNING: AI didn't consolidate enough! Got {unique_outputs}, wanted {max_groups}")
+        if target_groups and unique_outputs > target_groups * 1.2:  # Allow 20% over target
+            print(f"WARNING: AI didn't consolidate enough! Got {unique_outputs}, wanted {target_groups}")
 
         updated_count = update_advice_groups(mapping)
 
         new_advice_df = get_all_advice()
-        new_counts = new_advice_df['group_name'].value_counts().to_dict()
-
-        print(f"Regrouping complete: {len(counts)} → {len(new_counts)}")
+        new_counts = new_advice_df['regroup_name'].value_counts().to_dict()
 
         return updated_count # Number of rows updated
 
     except Exception as e:
         print(f"Failed to parse regrouping JSON: {e}")
         return 0
+    
+def regroup_clusters(client, batch_size=200, target_groups=None):
+    """
+    Regroup existing advice in database using API.
+    Takes advice groupings in batches, smallest groups first, and regroups them together
+    until there are fewer than max_groups groups. Then, if target_groups is specified, performs
+    another round of grouping with a constraint.
+    """
 
-def filter_advice(client, batch_size=25):
-    """
-    Filter out rows that don't contain standalone advice
-    """
-    print("Loading advice to filter...")
     advice_df = get_all_advice()
+    counts = advice_df['regroup_name'].value_counts().to_dict()
+
+    fail_max = 3
+    updated_count = 0
+
+    initial_group_count = len(counts)
+
+    print(f"Starting with {initial_group_count} groups")
+    print(f"Target: Reduce to ≤{batch_size} groups, then optionally to {target_groups}")
+
+    i = 0 # number of batches so far
+    f = 0 # number of failed batches so far
+    while len(counts) > batch_size and f < fail_max:
+        i += 1
+        # Regroup clusters, then load clusters again
+        pregroup_outputs = len(counts)
+
+        updated = regroup_clusters_batch(client, batch_size, target_groups=None)
+
+        if updated:
+            advice_df = get_all_advice()
+            counts = advice_df['regroup_name'].value_counts().to_dict()
+
+            postgroup_outputs = len(counts)
+            print(f"Regrouping batch {i} complete: {pregroup_outputs} → {postgroup_outputs}")
+
+            updated_count += updated
+        else:
+            print(f"Failed to regroup batch {i}; failure number {f}")
+            f += 1
     
-    print(f"Starting filtering and formatting with {len(advice_df)} advice items")
+    if f >= 3:
+        print(f"Exceeded failure limit of {fail_max}")
+        return updated_count
     
-    # Process advice in batches to avoid token limits
-    total_invalidated = 0
-    
-    for i in range(0, len(advice_df), batch_size):
-        batch = advice_df.iloc[i:i + batch_size]
-        
-        # Create list of advice items for the batch
-        advice_list = []
-        for idx, row in batch.iterrows():
-            advice_list.append(f"{row['advice_id']}: {row['advice_text']}")
-        
-        advice_text = "\n".join(advice_list)
-        
-        user_prompt = f"""
-Review these advice items and identify which ones are NOT actually actionable advice.
+    # Regroup one final time, using a constraint if it exists
+    if target_groups:
+        print(f"Final Consolidation to ~{target_groups} groups")
+        final_updated = regroup_clusters_batch(client, batch_size, target_groups=target_groups)
+        updated_count += final_updated if final_updated else 0
 
-Return JSON with advice_ids that should be marked as invalid:
-{{"invalid_ids": [123, 456, 789]}}
+    advice_df = get_all_advice()
+    counts = advice_df['regroup_name'].value_counts().to_dict()
 
-Mark as INVALID if the text is:
-- Not actionable and specific
-- Doesn't make sense standalone
-- Doesn't contain clear advice or instruction or recommendation
-
-INVALID Examples
-- "Do the fucking thing"
-- "pay that month's bill manually"
-- "Turn off notifications"
-- "I would 1000% suggest reading her book"
-- Incomplete fragments that don't give advice
-
-VALID examples (keep=true, with formatting):
-- "Set a consistent bedtime routine to improve sleep quality."
-- "Try the 5-minute rule: commit to doing a task for just 5 minutes."
-
-Advice items to process:
-{advice_text}
-"""
-        
-        completion = prompt_ai(
-            client,
-            messages=[
-                {"role": "system", "content": "You are a careful content filter and formatter. Output must be strictly valid JSON. Start response with '{' and end with '}'."},
-                {"role": "user", "content": user_prompt}
-            ]
-        )
-        
-        if not completion or not completion.choices:
-            print(f"No completion for batch {i//batch_size + 1}, keeping original")
-            continue
-        
-        raw = completion.choices[0].message.content
-        if not raw:
-            continue
-        
-        raw = raw.strip()
-        raw = sanitize_json_string(raw)
-        
-        try:
-            parsed = json.loads(raw)
-            invalid_ids = parsed.get("invalid_ids", [])
-
-            if invalid_ids:
-                invalidated = invalidate_advice(invalid_ids)
-                total_invalidated += invalidated
-                print(f"Batch {i//batch_size + 1}: Invalidated {invalidated} items")
-
-        except Exception as e:
-            print(f"Error processing batch {i//batch_size + 1}: {e}")
-    
-    print(f"Filtering complete: invalidated {total_invalidated} non-advice items")
-
-    return total_invalidated
+    print(f"Regrouping complete! {initial_group_count} → {len(counts)}")
+    return updated_count
 
 def process_unprocessed_posts(client, batch_size=BATCH_SIZE):
     """
@@ -459,3 +435,175 @@ def process_outdated_advice_posts(client, batch_size=BATCH_SIZE):
     
     print(f"\nProcessing complete! Processed {processed_count} posts in {batch_num} batches")
     return processed_count
+
+def filter_duplicates(model, similarity_threshold=0.95):
+    """
+    Use sentence embeddings to find and invalidate duplicate advice
+    """
+    print("Loading advice to filter...")
+    advice_df = get_all_advice()
+    total_removed = 0
+
+    for category in advice_df["regroup_name"].unique():
+        category_advice = advice_df[advice_df['regroup_name'] == category]
+
+        if len(category_advice) < 10:
+            print(f"Skipped {category} with only {len(category_advice)} advice items")
+            continue
+    
+        print(f"Processing '{category}' ({len(category_advice)} items)")
+
+        # Get embeddings for all advice in this category
+        texts = category_advice['advice_text'].tolist()
+        embeddings = model.encode(texts)
+
+        similarity_matrix = cosine_similarity(embeddings)
+
+        remove_indices = set()
+        kept_indices = set()
+        for i in range(len(similarity_matrix)):
+            if i in remove_indices or i in kept_indices:
+                continue
+                
+            # Find similar items
+            similar_indices = np.where(similarity_matrix[i] >= similarity_threshold)[0]
+            similar_indices = similar_indices[similar_indices != i]  # Exclude self
+            
+            if len(similar_indices) > 1:  # More than just self
+                # Keep best one based on quality score, remove others
+                candidates = category_advice.iloc[similar_indices]
+                
+                # Keep the one with most upvotes
+                best_idx = candidates['ups'].idxmax()
+                kept_indices.add(best_idx)
+                
+                # Mark others for removal
+                for idx in similar_indices:
+                    if category_advice.iloc[idx].name != best_idx:
+                        remove_indices.add(idx)
+        
+        # Remove duplicates
+        if remove_indices:
+            advice_ids_to_remove = category_advice.iloc[list(remove_indices)]['advice_id'].tolist()
+            removed = invalidate_advice(advice_ids_to_remove)
+            total_removed += removed
+            print(f"  Removed {removed} duplicates")
+    
+    print(f"Embedding deduplication complete: removed {total_removed} duplicates")
+    return total_removed
+
+def harmonic_mean(scores):
+    """Calculate harmonic mean, handling zero values"""
+    valid_scores = [s for s in scores if s > 0]
+    if not valid_scores:
+        return 0.0
+
+    harmonic_mean = statistics.harmonic_mean(valid_scores)
+
+    return round(harmonic_mean, 2) # Truncate
+
+def score_advice_quality(client, rescore_scored_advice=False, batch_size=20):
+    """Score all advice using LLM with metrics"""
+
+    # Old metrics:
+    # - COMPLETENESS: Is the advice complete and standalone? 
+
+    print("Loading advice for quality scoring...")
+    if rescore_scored_advice:
+        advice_df = get_all_advice()
+    else:
+        advice_df = get_unscored_advice()
+    
+    if len(advice_df) == 0:
+        print("No advice found")
+        return
+    
+    print(f"Scoring {len(advice_df)} advice items...")
+    
+    # Process in batches to avoid token limits
+    scored_advice = []
+    
+    for i in range(0, len(advice_df), batch_size):
+        batch = advice_df.iloc[i:i + batch_size]
+        
+        # Create advice items for scoring
+        advice_items = []
+        for _, row in batch.iterrows():
+            advice_items.append({
+                'id': row['advice_id'],
+                'category': row['regroup_name'],
+                'advice': row['advice_text']
+            })
+        
+        # Build prompt
+        items_text = ""
+        for item in advice_items:
+            items_text += f"ID: {item['id']}\nCategory: {item['category']}\nAdvice: {item['advice']}\n\n"
+        
+        prompt = f"""Score each piece of advice on 3 metrics from 0.0 to 1.0 (inclusive). 0.0 is very poor, 1.0 is excellent. Only use scores that are multiples of 0.1: 
+
+- CLARITY: Is it clear, specific, and well-writen?
+- OBJECTIVE: Is there a clear goal or reason for giving this advice?
+- PRACTICALITY: How realistic or feasible is it?
+
+Return JSON only:
+{{
+  "scores": [
+    {{"id": 123, "clarity": 0.8, "objective": 0.9, "practicality": 0.7}},
+    {{"id": 124, "clarity": 0.3, "objective": 0.6, "practicality": 0.9}}
+  ]
+}}
+
+Advice to score:
+{items_text}"""
+
+        completion = prompt_ai(client, messages=[
+            {"role": "system", "content": "You are a precise advice quality evaluator. Return only valid JSON with numeric scores."},
+            {"role": "user", "content": prompt}
+        ])
+        
+        if not completion or not completion.choices:
+            print(f"  Batch {i//batch_size + 1} failed - no response")
+            continue
+        
+        raw = sanitize_json_string(completion.choices[0].message.content)
+        
+        try:
+            result = json.loads(raw)
+            batch_scores = result.get("scores", [])
+            
+            # Calculate harmonic means and store results
+            for score_data in batch_scores:
+                advice_id = score_data.get("id")
+                clarity = score_data.get("clarity", 0) 
+                objective = score_data.get("objective", 0)
+                practicality = score_data.get("practicality", 0)
+                
+                # Calculate harmonic mean
+                quality_score = harmonic_mean([clarity, objective, practicality])
+                
+                scored_advice.append({
+                    'advice_id': advice_id,
+                    'clarity': clarity,
+                    'objective': objective,
+                    'practicality': practicality,
+                    'quality_score': quality_score
+                })
+            
+            print(f"  Batch {i//batch_size + 1}: scored {len(batch_scores)} items")
+            
+        except Exception as e:
+            print(f"  Batch {i//batch_size + 1} failed: {e}")
+            continue
+    
+    if not scored_advice:
+        print("No advice was successfully scored")
+        return None
+    
+    # Save scores to database
+    scores_df = pd.DataFrame(scored_advice)
+    save_quality_scores_to_db(scores_df)
+    
+    print(f"Quality scoring complete: {len(scored_advice)} items scored")
+    
+    return scores_df
