@@ -30,7 +30,8 @@ def init_database():
             group_name TEXT,
             regroup_name TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_valid BOOLEAN DEFAULT TRUE
+            is_duplicate BOOLEAN DEFAULT FALSE,
+            is_safe BOOLEAN DEFAULT TRUE
         );
 
         -- Processing status tracking
@@ -47,8 +48,9 @@ def init_database():
         CREATE TABLE IF NOT EXISTS advice_quality_scores (
             advice_id INTEGER PRIMARY KEY REFERENCES advice(advice_id),
             clarity REAL, 
-            objective REAL,
+            completeness REAL,
             practicality REAL,
+            universality REAL,
             quality_score REAL,
             scored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -132,27 +134,6 @@ def get_outdated_advice_posts(processing_version, limit=None):
     
     with get_db_connection() as conn:
         return pd.read_sql(query, conn, params=(processing_version,))
-
-def get_unscored_advice():
-    """Get all valid advice that doesn't have quality scores yet"""
-    with get_db_connection() as conn:
-        return pd.read_sql('''
-        SELECT 
-            a.advice_id,
-            a.post_id,
-            a.advice_text,
-            a.group_name,
-            a.created_at,
-            p.title,
-            p.ups,
-            p.upvote_ratio,
-            p.subreddit_name_prefixed
-        FROM advice a
-        JOIN posts p ON a.post_id = p.id
-        LEFT JOIN advice_quality_scores q ON a.advice_id = q.advice_id
-        WHERE a.is_valid = TRUE AND q.advice_id IS NULL
-        ORDER BY p.ups DESC, a.created_at DESC
-        ''', conn)
 
 def mark_posts_completed(post_ids, processing_version, model_name):
     """Mark posts as successfully processed"""
@@ -259,18 +240,25 @@ def update_advice_groups(group_mapping):
     
     return updated_count
 
-def invalidate_advice(advice_ids):
-    """Mark advice as invalid (not real advice)"""
+def get_table_columns(table_name):
+    with get_db_connection() as conn:
+        cursor = conn.execute(f"PRAGMA table_info({table_name})")
+        return [row[1] for row in cursor.fetchall()]
+
+def mark_advice_flag(advice_ids, flag_name, value=True):
+    """Mark a boolean-style flag column on advice rows."""
     if not advice_ids:
         return 0
-        
+
+    # Dynamically get column names from the advice table
+    valid_columns = get_table_columns("advice")
+    if flag_name not in valid_columns:
+        raise ValueError(f"Invalid flag name: {flag_name}")
+
     with get_db_connection() as conn:
-        placeholders = ','.join(['?' for _ in advice_ids])
-        result = conn.execute(f'''
-        UPDATE advice 
-        SET is_valid = FALSE 
-        WHERE advice_id IN ({placeholders})
-        ''', advice_ids)
+        placeholders = ",".join(["?" for _ in advice_ids])
+        sql = f"UPDATE advice SET {flag_name} = ? WHERE advice_id IN ({placeholders})"
+        result = conn.execute(sql, [int(value)] + advice_ids)
         conn.commit()
         return result.rowcount
 
@@ -285,8 +273,8 @@ def cleanup_failed_processing():
         conn.commit()
         return result.rowcount
 
-def get_all_advice():
-    """Get all valid advice with metadata"""
+def get_unscored_advice():
+    """Get all valid advice that doesn't have quality scores yet"""
     with get_db_connection() as conn:
         return pd.read_sql('''
         SELECT 
@@ -302,9 +290,55 @@ def get_all_advice():
             p.subreddit_name_prefixed
         FROM advice a
         JOIN posts p ON a.post_id = p.id
-        WHERE a.is_valid = TRUE
+        LEFT JOIN advice_quality_scores q ON a.advice_id = q.advice_id
+        WHERE a.is_duplicate = FALSE AND a.is_safe = TRUE AND q.universality IS NULL
         ORDER BY p.ups DESC, a.created_at DESC
         ''', conn)
+
+def get_all_advice():
+    """Get all valid advice."""
+    with get_db_connection() as conn:
+        return pd.read_sql('''
+        SELECT 
+            a.advice_id,
+            a.post_id,
+            a.advice_text,
+            a.group_name,
+            a.regroup_name,
+            a.created_at,
+            p.title,
+            p.ups,
+            p.upvote_ratio,
+            p.subreddit_name_prefixed
+        FROM advice a
+        JOIN posts p ON a.post_id = p.id
+        WHERE a.is_duplicate = FALSE AND a.is_safe = TRUE
+        ORDER BY p.ups DESC, a.created_at DESC
+        ''', conn)
+
+def get_full_database():
+    """
+    Load the entire database into a single merged DataFrame.
+    Joins advice with posts, processing_status, and advice_quality_scores.
+    """
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        # Load each table into a DataFrame
+        posts_df = pd.read_sql("SELECT * FROM posts", conn)
+        advice_df = pd.read_sql("SELECT * FROM advice", conn)
+        status_df = pd.read_sql("SELECT * FROM processing_status", conn)
+        scores_df = pd.read_sql("SELECT * FROM advice_quality_scores", conn)
+
+    # Merge advice with posts
+    merged = advice_df.merge(posts_df, how="left", left_on="post_id", right_on="id", suffixes=("_advice", "_post"))
+
+    # Merge with processing_status
+    merged = merged.merge(status_df, how="left", left_on="post_id", right_on="post_id", suffixes=("", "_status"))
+
+    # Merge with quality scores
+    merged = merged.merge(scores_df, how="left", left_on="advice_id", right_on="advice_id", suffixes=("", "_score"))
+
+    return merged
+
 
 def export_advice_to_csv(filename, quality_threshold=0.0):
     """Export advice in a clean format optimized for website display"""
@@ -319,17 +353,19 @@ def export_advice_to_csv(filename, quality_threshold=0.0):
             p.upvote_ratio as upvote_ratio,
             p.subreddit_name_prefixed as subreddit,
             s.clarity as clarity_score,
-            s.objective as objective_score,
+            s.completeness as completeness_score,
             s.practicality as practicality_score,
+            s.universality as universality_score,
             s.quality_score as quality_score
         FROM advice a
         JOIN posts p ON a.post_id = p.id
         JOIN advice_quality_scores s ON s.advice_id = a.advice_id
-        WHERE a.is_valid = TRUE 
+        WHERE a.is_duplicate = FALSE 
+            AND a.is_safe = TRUE
             AND s.quality_score >= ?
             AND a.regroup_name <> ?
         ORDER BY a.regroup_name, p.ups DESC
-        ''', conn, params=[quality_threshold, "Addiction"])
+        ''', conn, params=[quality_threshold, "placeholder"])
     
     if len(df) == 0:
         print("No advice to export")

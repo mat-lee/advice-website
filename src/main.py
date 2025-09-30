@@ -43,19 +43,38 @@ if __name__ == "__main__":
     # print("Step 2: Processing outdated posts...")
     # process_outdated_advice_posts(client)
     
-    # # Regroup advice clusters
+    # Regroup advice clusters
     # print("Step 3: Regrouping advice clusters...")
     # regroup_clusters(client, target_groups=None)
     
+    # ---------- Filtering and Scoring ----------
+
     # # Filter invalid advice and set invalid
     # print("Step 4: Filtering duplicate advice...")
-    # filter_duplicates(sentence_transformer, similarity_threshold=0.95)
+    # filter_duplicates(sentence_transformer, similarity_threshold=0.90)
+
+    # # Filter links and profanity
+    # print("Step 5: Filtering links and profanity")
+    # filter_links_and_profanity()
+
+    # # Filter sarcasm and harmful advice
+    # print("Step 6: Filtering sarcastic and harmful advice")
+    # filter_sarcastic_or_harmful_advice(client)
 
     # Score advice
-    # print("Step 5: Give advice usefulness score")
-    # score_advice_quality(client, rescore_scored_advice=True)
+    print("Step 7: Give advice usefulness score")
+    score_advice_quality(client, rescore_scored_advice=False)
 
-    # # # Export
-    print("Step 6: Exporting advice")
+    # Export
+    print("Step 8: Exporting advice")
     export_advice_to_csv("advice_export.csv", quality_threshold=0.0)
     print("Exported advice!")
+
+    # db = get_full_database()
+
+    # with get_db_connection() as conn:
+    #     conn.execute("""ALTER TABLE advice_quality_scores DROP COLUMN objective;""")
+
+    #     conn.execute("""ALTER TABLE advice_quality_scores ADD COLUMN completeness REAL;""")
+    #     conn.execute("""ALTER TABLE advice_quality_scores ADD COLUMN universality REAL;""")
+    #     conn.commit()

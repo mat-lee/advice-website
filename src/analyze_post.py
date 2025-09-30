@@ -12,6 +12,7 @@ import hdbscan
 import numpy as np
 from openai import OpenAI
 import pandas as pd
+from better_profanity import profanity
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 from sklearn.metrics.pairwise import cosine_similarity
@@ -21,13 +22,19 @@ PROCESSING_VERSION = 1.1
 
 # FREE_OPENROUTER_MODEL = "mistralai/devstral-small-2505:free" # Super lightweight model
 # FREE_OPENROUTER_MODEL = "openrouter/sonoma-dusk-alpha"
-FREE_OPENROUTER_MODEL = "x-ai/grok-4-fast:free"
-# FREE_OPENROUTER_MODEL = "deepseek/deepseek-chat-v3.1:free"
+# FREE_OPENROUTER_MODEL = "x-ai/grok-4-fast:free"
+FREE_OPENROUTER_MODEL = "deepseek/deepseek-chat-v3.1:free"
 
 MAX_CHARS = 10000 # approximately 2500 tokens
 BATCH_SIZE = 10
 
 load_dotenv()
+
+# Remove words from the list of profanity
+profanity.load_censor_words()
+for word in ["stupid", "poop", "god", "kill", "suck", "piss", "potty"]:
+    if word in profanity.CENSOR_WORDSET:
+        profanity.CENSOR_WORDSET.remove(word)
 
 # Planned features: make a new file that shows whether or not a specific post id has been processed to find advice or not.
 # Allow the option for it a be a continuous process; it automatically adds to process_data so if there's an interruption it won't lose progress.
@@ -337,8 +344,10 @@ def regroup_clusters(client, batch_size=200, target_groups=None):
     # Regroup one final time, using a constraint if it exists
     if target_groups:
         print(f"Final Consolidation to ~{target_groups} groups")
-        final_updated = regroup_clusters_batch(client, batch_size, target_groups=target_groups)
-        updated_count += final_updated if final_updated else 0
+    else:
+        print(f"Final Consolidation")
+    final_updated = regroup_clusters_batch(client, batch_size, target_groups=target_groups)
+    updated_count += final_updated if final_updated else 0
 
     advice_df = get_all_advice()
     counts = advice_df['regroup_name'].value_counts().to_dict()
@@ -436,13 +445,20 @@ def process_outdated_advice_posts(client, batch_size=BATCH_SIZE):
     print(f"\nProcessing complete! Processed {processed_count} posts in {batch_num} batches")
     return processed_count
 
-def filter_duplicates(model, similarity_threshold=0.95):
+def filter_duplicates(model, similarity_threshold=0.90):
     """
-    Use sentence embeddings to find and invalidate duplicate advice
+    Use sentence embeddings to find and invalidate duplicate advice.
+    From my testing, 0.9 seemed to be a good number.
     """
     print("Loading advice to filter...")
     advice_df = get_all_advice()
     total_removed = 0
+
+    if len(advice_df) == 0:
+        print("No advice found to filter")
+        return 0
+
+    print(f"Filtering duplicates from {len(advice_df)} advice items...")
 
     for category in advice_df["regroup_name"].unique():
         category_advice = advice_df[advice_df['regroup_name'] == category]
@@ -472,9 +488,10 @@ def filter_duplicates(model, similarity_threshold=0.95):
             if len(similar_indices) > 1:  # More than just self
                 # Keep best one based on quality score, remove others
                 candidates = category_advice.iloc[similar_indices]
+                print(candidates['advice_text'].tolist())
                 
-                # Keep the one with most upvotes
-                best_idx = candidates['ups'].idxmax()
+                # Keep the one with the highest upvote ratio
+                best_idx = candidates['upvote_ratio'].idxmax()
                 kept_indices.add(best_idx)
                 
                 # Mark others for removal
@@ -485,12 +502,146 @@ def filter_duplicates(model, similarity_threshold=0.95):
         # Remove duplicates
         if remove_indices:
             advice_ids_to_remove = category_advice.iloc[list(remove_indices)]['advice_id'].tolist()
-            removed = invalidate_advice(advice_ids_to_remove)
+            removed = mark_advice_flag(advice_ids_to_remove, "is_duplicate", True)
             total_removed += removed
-            print(f"  Removed {removed} duplicates")
+            print(f"  Removed {removed} duplicates out of {len(advice_df)} items")
     
     print(f"Embedding deduplication complete: removed {total_removed} duplicates")
     return total_removed
+
+def filter_links_and_profanity(batch_size=5000):
+    """
+    Filter links and profanities from advice text by invalidating them.
+    """
+    print("Loading advice to filter...")
+    advice_df = get_all_advice()
+    
+    if len(advice_df) == 0:
+        print("No advice found to filter")
+        return 0
+    
+    print(f"Applying safety filters to {len(advice_df)} advice items...")
+    total_unsafe_ids = 0
+    
+    # Process in batches
+    for i in range(0, len(advice_df), batch_size):
+        batch = advice_df.iloc[i:i + batch_size]
+        print(f"Processing batch {i//batch_size + 1}/{(len(advice_df)-1)//batch_size + 1} ({len(batch)} items)")
+        
+        batch_unsafe_ids = []
+        
+        for _, row in batch.iterrows():
+            advice_text = row['advice_text']
+            
+            # Filter links
+            url_patterns = [
+                r'https?://\S+',
+                r'www\.\S+',
+                r'\S+\.(com|org|net|edu|gov|io|co)\S*',
+                r'discord\.gg/',
+                r'bit\.ly/',
+                r'tinyurl\.',
+            ]
+            
+            if any(re.search(pattern, advice_text, re.IGNORECASE) for pattern in url_patterns):
+                batch_unsafe_ids.append(row['advice_id'])
+                # print(advice_text)
+                continue
+                
+            # Profanity check
+            if profanity.contains_profanity(advice_text):
+                # print(advice_text)
+                batch_unsafe_ids.append(row['advice_id'])
+                continue
+        
+        # Mark unsafe items in this batch
+        if batch_unsafe_ids:
+            mark_advice_flag(batch_unsafe_ids, "is_safe", False)
+            print(f"  Found and marked {len(batch_unsafe_ids)} unsafe items in this batch")
+            total_unsafe_ids += len(batch_unsafe_ids)
+        else:
+            print(f"  No unsafe items found in this batch")
+    
+    print(f"Safety filtering complete: updated {total_unsafe_ids} items total")
+    return total_unsafe_ids
+
+def filter_sarcastic_or_harmful_advice(client, batch_size=20):
+    """
+    Use an LLM to flag advice that is sarcastic or harmful and mark it INVALID.
+    """
+    print("Loading advice to scan for sarcasm/harm...")
+    advice_df = get_all_advice()
+
+    if len(advice_df) == 0:
+        print("No advice to filter")
+        return 0
+
+    print(f"Scanning {len(advice_df)} advice items...")
+    total_invalidated = 0
+
+    for i in range(0, len(advice_df), batch_size):
+        batch = advice_df.iloc[i:i + batch_size]
+
+        # Prepare "id: text" lines for this batch
+        lines = []
+        for _, row in batch.iterrows():
+            lines.append(f"{row['advice_id']}: {row['advice_text']}")
+        advice_block = "\n".join(lines)
+
+        user_prompt = f"""
+You are a safety reviewer. Identify advice that is clearly sarcastic or harmful.
+
+Return ONLY valid JSON:
+{{"invalid_ids": [123, 456]}}
+
+Definitions:
+- Sarcastic: mockery/irony that undermines clarity or ridicules.
+- Harmful: promotes self-harm, harm to others, illegal acts, hate/harassment, dangerous medical/financial advice, or abusive language.
+
+Mark INVALID if:
+- Sarcastic to the point of being dismissive,
+- Contains slurs, threats, harassment,
+- Suggests dangerous/illegal actions.
+
+Mark VALID if:
+- Neutral, direct, or blunt but not attacking,
+- Critiques ideas/actions without encouraging harm.
+
+Review these items ("advice_id: advice_text"):
+{advice_block}
+"""
+
+        completion = prompt_ai(
+            client,
+            messages=[
+                {"role": "system", "content": "You filter out sarcastic or harmful advice. Return only valid JSON."},
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+
+        if not completion or not getattr(completion, "choices", None):
+            continue
+
+        raw = completion.choices[0].message.content or ""
+        raw = sanitize_json_string(raw)
+
+        try:
+            parsed = json.loads(raw)
+            invalid_ids = parsed.get("invalid_ids", [])
+            if invalid_ids:
+                # mark these as invalid in DB
+                invalidated = mark_advice_flag(invalid_ids, "is_safe", False)
+                total_invalidated += invalidated
+                print(f"Batch {i//batch_size + 1}: Invalidated {invalidated} sarcastic/harmful items")
+                # for invalid_id in invalid_ids:
+                #     print(advice_df[advice_df['advice_id'] == invalid_id]['advice_text'].tolist())
+        except Exception as e:
+            print(f"Error processing batch {i//batch_size + 1}: {e}")
+            continue
+
+    print(f"Sarcasm/harm filtering complete: invalidated {total_invalidated} items")
+    return total_invalidated
+
 
 def harmonic_mean(scores):
     """Calculate harmonic mean, handling zero values"""
@@ -521,7 +672,7 @@ def score_advice_quality(client, rescore_scored_advice=False, batch_size=20):
     print(f"Scoring {len(advice_df)} advice items...")
     
     # Process in batches to avoid token limits
-    scored_advice = []
+    total_scored = 0
     
     for i in range(0, len(advice_df), batch_size):
         batch = advice_df.iloc[i:i + batch_size]
@@ -542,15 +693,20 @@ def score_advice_quality(client, rescore_scored_advice=False, batch_size=20):
         
         prompt = f"""Score each piece of advice on 3 metrics from 0.0 to 1.0 (inclusive). 0.0 is very poor, 1.0 is excellent. Only use scores that are multiples of 0.1: 
 
-- CLARITY: Is it clear, specific, and well-writen?
-- OBJECTIVE: Is there a clear goal or reason for giving this advice?
-- PRACTICALITY: How realistic or feasible is it?
+CLARITY: How clear to average person?
+COMPLETENESS: Stands alone and makes sense?
+PRACTICALITY: Realistic actionable steps?
+UNIVERSALITY: Broadly applicable and objectively good?
+
+Examples:
+- "Be happy" → 0.9, 0.1, 0.1, 0.2
+- "Appoint someone you trust with passwords and give them physical copy" → 0.9, 0.9, 0.8, 0.9
 
 Return JSON only:
 {{
   "scores": [
-    {{"id": 123, "clarity": 0.8, "objective": 0.9, "practicality": 0.7}},
-    {{"id": 124, "clarity": 0.3, "objective": 0.6, "practicality": 0.9}}
+    {{"id": 123, "clarity": 0.8, "completeness": 0.9, "practicality": 0.7, "universality": 0.7}},
+    {{"id": 124, "clarity": 0.3, "completeness": 0.6, "practicality": 0.9, "universality": 0.4}}
   ]
 }}
 
@@ -573,36 +729,39 @@ Advice to score:
             batch_scores = result.get("scores", [])
             
             # Calculate harmonic means and store results
+            scored_advice = []
             for score_data in batch_scores:
                 advice_id = score_data.get("id")
                 clarity = score_data.get("clarity", 0) 
-                objective = score_data.get("objective", 0)
+                completeness = score_data.get("completeness", 0)
                 practicality = score_data.get("practicality", 0)
+                universality = score_data.get("universality", 0)
                 
                 # Calculate harmonic mean
-                quality_score = harmonic_mean([clarity, objective, practicality])
+                quality_score = harmonic_mean([clarity, completeness, practicality, universality])
                 
                 scored_advice.append({
                     'advice_id': advice_id,
                     'clarity': clarity,
-                    'objective': objective,
+                    'completeness': completeness,
                     'practicality': practicality,
+                    'universality': universality,
                     'quality_score': quality_score
                 })
             
-            print(f"  Batch {i//batch_size + 1}: scored {len(batch_scores)} items")
+            if scored_advice:
+                scores_df = pd.DataFrame(scored_advice)
+                save_quality_scores_to_db(scores_df)
+                total_scored += len(scored_advice)
+                print(f"  Batch {i//batch_size + 1}: scored and saved {len(scored_advice)} items (total: {total_scored})")
             
         except Exception as e:
             print(f"  Batch {i//batch_size + 1} failed: {e}")
             continue
     
-    if not scored_advice:
+    if total_scored == 0:
         print("No advice was successfully scored")
         return None
-    
-    # Save scores to database
-    scores_df = pd.DataFrame(scored_advice)
-    save_quality_scores_to_db(scores_df)
     
     print(f"Quality scoring complete: {len(scored_advice)} items scored")
     
