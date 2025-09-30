@@ -24,42 +24,42 @@ if __name__ == "__main__":
         "selfimprovement",     # Personal development
         "getmotivated",        # Motivational advice
         "decidingtobebetter",  # Self-improvement focused
-        "lifehacks",          # Practical tips
-        "LifeProTips",        # Life advice
-        "studytips",          # Academic advice
-        "fitness",            # Health/fitness advice
-        "personalfinance"     # Financial advice
+        # "lifehacks",          # Practical tips
+        # "LifeProTips",        # Life advice
+        # "studytips",          # Academic advice
+        # "fitness",            # Health/fitness advice
+        # "personalfinance"     # Financial advice
     ]
 
     # print("Step 1: Scraping subreddits...")
 
-    # total_new = scrape_multiple_subreddits(target_subreddits, time_filter="all", limit=500)
+    total_new = scrape_multiple_subreddits(target_subreddits, time_filter="year", limit=5000)
 
-    # # Process unprocessed posts
-    # print("Step 2: Processing unprocessed posts...")
-    # processed_count = process_unprocessed_posts(client)
+    # Process unprocessed posts
+    print("Step 2: Processing unprocessed posts...")
+    processed_count = process_unprocessed_posts(client)
 
     # # Process outdated posts
-    # print("Step 2: Processing outdated posts...")
+    # print("Step 2.5: Processing outdated posts...")
     # process_outdated_advice_posts(client)
     
     # Regroup advice clusters
-    # print("Step 3: Regrouping advice clusters...")
-    # regroup_clusters(client, target_groups=None)
+    print("Step 3: Regrouping advice clusters...")
+    regroup_clusters(client, target_groups=None)
     
     # ---------- Filtering and Scoring ----------
 
-    # # Filter invalid advice and set invalid
-    # print("Step 4: Filtering duplicate advice...")
-    # filter_duplicates(sentence_transformer, similarity_threshold=0.90)
+    # Filter invalid advice and set invalid
+    print("Step 4: Filtering duplicate advice...")
+    filter_duplicates(sentence_transformer, similarity_threshold=0.90)
 
-    # # Filter links and profanity
-    # print("Step 5: Filtering links and profanity")
-    # filter_links_and_profanity()
+    # Filter links and profanity
+    print("Step 5: Filtering links and profanity")
+    filter_links_and_profanity()
 
-    # # Filter sarcasm and harmful advice
-    # print("Step 6: Filtering sarcastic and harmful advice")
-    # filter_sarcastic_or_harmful_advice(client)
+    # Filter sarcasm and harmful advice
+    print("Step 6: Filtering sarcastic and harmful advice")
+    filter_sarcastic_or_harmful_advice(client)
 
     # Score advice
     print("Step 7: Give advice usefulness score")
