@@ -291,7 +291,14 @@ def get_unscored_advice():
         FROM advice a
         JOIN posts p ON a.post_id = p.id
         LEFT JOIN advice_quality_scores q ON a.advice_id = q.advice_id
-        WHERE a.is_duplicate = FALSE AND a.is_safe = TRUE AND q.universality IS NULL
+        WHERE a.is_duplicate = FALSE AND a.is_safe = TRUE 
+            AND (
+               clarity IS NULL 
+            OR q.completeness IS NULL 
+            OR q.practicality IS NULL 
+            OR q.universality IS NULL 
+            OR q.quality_score IS NULL
+            )
         ORDER BY p.ups DESC, a.created_at DESC
         ''', conn)
 
@@ -365,7 +372,7 @@ def export_advice_to_csv(filename, quality_threshold=0.0):
             AND s.quality_score >= ?
             AND a.regroup_name <> ?
         ORDER BY a.regroup_name, p.ups DESC
-        ''', conn, params=[quality_threshold, "placeholder"])
+        ''', conn, params=[quality_threshold, "placeholderxxx"])
     
     if len(df) == 0:
         print("No advice to export")

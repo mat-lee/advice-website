@@ -13,6 +13,7 @@ function AdviceAggregator() {
   const [sortOrder, setSortOrder] = useState('desc');
   const [hoveredItem, setHoveredItem] = useState(null);
   const [defaultGroupSet, setDefaultGroupSet] = useState(false);
+  const [showLanding, setShowLanding] = useState(true);
 
   // normalize helper
   const norm = (s) => (typeof s === 'string' ? s.trim().toLowerCase() : '');
@@ -91,7 +92,6 @@ function AdviceAggregator() {
   // Set default group when data loads
   useEffect(() => {
     if (adviceData.length > 0 && !defaultGroupSet && groupOptions.length > 0) {
-      setSelectedGroup(groupOptions[0].value);
       setDefaultGroupSet(true);
     }
   }, [adviceData, groupOptions, defaultGroupSet]);
@@ -155,13 +155,18 @@ function AdviceAggregator() {
   const clearFilters = () => {
     setSearchTerm('');
     setSelectedSubreddit('');
-    // Don't clear selectedGroup - keep it selected
+  };
+
+  const selectCategory = (categoryValue) => {
+    setSelectedGroup(categoryValue);
+    setShowLanding(false);
   };
 
   const formatNumber = (num) => (num >= 1000 ? (num / 1000).toFixed(1) + 'k' : num.toString());
   
   const copyToClipboard = (text, e) => { 
     e.stopPropagation(); 
+    e.preventDefault();
     navigator.clipboard?.writeText(text);
   };
 
@@ -196,6 +201,33 @@ function AdviceAggregator() {
 
   return (
     <div className="min-h-screen bg-white">
+      {/* Landing Page */}
+      {showLanding && (
+        <div className="fixed inset-0 bg-gradient-to-br from-gray-50 to-white z-50 flex items-center justify-center transition-transform duration-700 ease-in-out">
+          <div className="max-w-5xl mx-auto px-6 py-12 text-center">
+            <h1 className="text-5xl font-medium text-gray-900 mb-4">
+              What kind of advice do you want?
+            </h1>
+            <p className="text-gray-600 mb-12 text-lg">
+              Choose a category to explore curated wisdom from Reddit
+            </p>
+            
+            {/* Category Bubbles */}
+            <div className="flex flex-wrap justify-center gap-3 max-w-4xl mx-auto">
+              {groupOptions.map((opt) => (
+                <button
+                  key={opt.value}
+                  onClick={() => selectCategory(opt.value)}
+                  className="px-6 py-3 bg-white border-2 border-gray-200 rounded-full text-gray-900 font-medium hover:border-gray-900 hover:bg-gray-900 hover:text-white transition-all duration-200 shadow-sm hover:shadow-md transform hover:scale-105"
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Simple Header */}
       <div className="border-b border-gray-200 bg-white sticky top-0 z-10">
         <div className="max-w-4xl mx-auto px-6 py-4">
@@ -282,34 +314,31 @@ function AdviceAggregator() {
 
       {/* Advice List */}
       <div className="max-w-4xl mx-auto px-6 py-3">
-        <div className="divide-y divide-gray-100">
+        <div className="space-y-1">
           {visibleData.map((item) => (
-            <div
+            <a
               key={item.__key}
-              className="group relative py-2 px-4 hover:bg-gray-50 rounded-lg transition-colors cursor-pointer"
+              href={`https://www.reddit.com/r/${item.subreddit}/comments/${item.id}/`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="group relative py-2 px-3 hover:bg-gray-50 rounded transition-colors cursor-pointer flex items-center justify-between no-underline"
               onMouseEnter={() => setHoveredItem(item)}
               onMouseLeave={() => setHoveredItem(null)}
             >
               {/* Advice Text */}
-              <div className="text-gray-900 leading-relaxed mb-2">
+              <div className="text-gray-900 text-base leading-relaxed flex-1">
                 {item.advice}
               </div>
 
-              {/* Metadata Row - completely minimal, no category shown */}
-              <div className="flex items-center justify-between text-xs text-gray-500">
-                <div className="flex items-center">
-                  {/* Empty - no metadata shown by default */}
-                </div>
-                
-                <div className="flex items-center space-x-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <button
-                    onClick={(e) => copyToClipboard(item.advice, e)}
-                    className="p-1 hover:text-gray-900 transition-colors"
-                    title="Copy advice"
-                  >
-                    <Copy className="w-3 h-3" />
-                  </button>
-                </div>
+              {/* Copy button */}
+              <div className="flex items-center ml-3 opacity-0 group-hover:opacity-100 transition-opacity">
+                <button
+                  onClick={(e) => copyToClipboard(item.advice, e)}
+                  className="p-1 hover:text-gray-900 transition-colors text-gray-500"
+                  title="Copy advice"
+                >
+                  <Copy className="w-3 h-3" />
+                </button>
               </div>
 
               {/* Hover Tooltip with detailed info */}
@@ -324,7 +353,7 @@ function AdviceAggregator() {
                   </div>
                 </div>
               )}
-            </div>
+            </a>
           ))}
         </div>
 
